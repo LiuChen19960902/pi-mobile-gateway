@@ -1,0 +1,34 @@
+# 依赖
+node_modules/
+
+# 运行时产物
+*.log
+.tmp/
+
+# 系统文件
+.DS_Store
+
+# 外部索引工具工件
+.codegraph/
+
+# 私有开发资料与 agent 运行状态，不进入公开仓库
+# 已跟踪文件不受 ignore 影响；首次公开须从筛选后的快照发布。
+.agents/
+.pi/
+AGENTS.md
+Docs/reviews/
+# Agent 状态能力实验草案（worktree 内维护，不进主线发布）
+/TASK-STATUS-CAPABILITY-DRAFT.md
+
+# 本机配置、凭据与签名材料
+.env
+.env.*
+devices.json
+auth.json
+models.json
+*.key
+*.pem
+*.jks
+*.keystore
+*.p12
+*.pfx

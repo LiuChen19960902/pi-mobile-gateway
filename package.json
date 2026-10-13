@@ -1,0 +1,33 @@
+{
+	"name": "pi-mobile-gateway",
+	"version": "0.3.0",
+	"private": true,
+	"description": "让手机通过设备鉴权的 WebSocket 连接使用本机 pi：数据面 WS + localhost 管理面，配对码与设备 token 鉴权",
+	"author": "FineCat",
+	"license": "MIT",
+	"type": "module",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"start": "node src/main.ts",
+		"typecheck": "tsc --noEmit",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"test": "node --experimental-strip-types --test tests/*.test.ts",
+		"check": "npm run typecheck && npm run lint && npm test"
+	},
+	"dependencies": {
+		"@earendil-works/pi-coding-agent": "1.0.4",
+		"@earendil-works/pi-tui": "1.1.0",
+		"qrcode-terminal": "0.12.0",
+		"ws": "8.21.3"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.7",
+		"@types/node": "24.13.3",
+		"@types/qrcode-terminal": "0.12.2",
+		"@types/ws": "8.18.1",
+		"typescript": "5.9.3"
+	}
+}
