@@ -40,18 +40,48 @@ export interface WorkspaceInfo {
 const MAXIMUM_ENTRIES = 500;
 
 /** Client-facing validation failure; the router echoes the message. */
-export class DirectoryError extends Error {}
+export class DirectoryError extends Error {
+	readonly code: string;
+	constructor(message: string, code = "bad-request") {
+		super(message);
+		this.code = code;
+	}
+}
 
-function requireAbsoluteDirectory(path: string): string {
+/** Only stable categories cross the wire; never include OS messages or paths. */
+export function classifyDirectoryError(error: unknown): DirectoryError | null {
+	if (error instanceof DirectoryError) return error;
+	const code = (error as NodeJS.ErrnoException | null)?.code;
+	switch (code) {
+		case "EACCES":
+		case "EPERM":
+			return new DirectoryError("没有目录访问权限", "directory-permission-denied");
+		case "ENOENT":
+			return new DirectoryError("目录不存在", "directory-not-found");
+		case "ENOTDIR":
+			return new DirectoryError("路径不是目录", "directory-not-directory");
+		case "EEXIST":
+			return new DirectoryError("同名条目已存在", "directory-name-conflict");
+		case "EROFS":
+			return new DirectoryError("目录只读", "filesystem-read-only");
+		case "ENOSPC":
+		case "EDQUOT":
+			return new DirectoryError("宿主存储空间不足", "storage-full");
+		default:
+			return null;
+	}
+}
+
+export function requireAbsoluteDirectory(path: string): string {
 	if (!isAbsolute(path)) throw new DirectoryError("path 必须是绝对路径");
 	const resolved = resolve(path);
 	let stat: import("node:fs").Stats;
 	try {
 		stat = statSync(resolved);
-	} catch {
-		throw new DirectoryError("目录不存在");
+	} catch (error) {
+		throw classifyDirectoryError(error) ?? error;
 	}
-	if (!stat.isDirectory()) throw new DirectoryError("不是目录");
+	if (!stat.isDirectory()) throw new DirectoryError("路径不是目录", "directory-not-directory");
 	return resolved;
 }
 
@@ -95,11 +125,11 @@ export function listDirectories(rawPath: string | undefined): DirectoryListing {
 
 function validDirectoryName(rawName: unknown): string {
 	if (typeof rawName !== "string" || rawName.trim() === "") {
-		throw new DirectoryError("文件夹名称不能为空");
+		throw new DirectoryError("文件夹名称不能为空", "directory-name-invalid");
 	}
 	const trimmed = rawName.trim();
 	if (trimmed === "." || trimmed === ".." || trimmed.includes("/") || trimmed.includes("\\")) {
-		throw new DirectoryError("文件夹名称不合法");
+		throw new DirectoryError("文件夹名称不合法", "directory-name-invalid");
 	}
 	return trimmed;
 }
@@ -111,11 +141,12 @@ export function createDirectory(rawParent: string, rawName: string): DirectoryCr
 	let stat: import("node:fs").Stats;
 	try {
 		stat = statSync(target);
-	} catch {
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
 		mkdirSync(target);
 		return { path: target, created: true };
 	}
-	if (!stat.isDirectory()) throw new DirectoryError("同名条目已存在且不是目录");
+	if (!stat.isDirectory()) throw new DirectoryError("同名条目已存在", "directory-name-conflict");
 	return { path: target, created: false };
 }
 
@@ -131,7 +162,7 @@ export function createWorkspaceAt(rawPath: string): WorkspaceInfo {
 		if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
 	}
 	const stat = statSync(resolved);
-	if (!stat.isDirectory()) throw new DirectoryError("不是目录");
+	if (!stat.isDirectory()) throw new DirectoryError("路径不是目录", "directory-not-directory");
 	const now = new Date().toISOString();
 	return {
 		workspaceId: resolved,

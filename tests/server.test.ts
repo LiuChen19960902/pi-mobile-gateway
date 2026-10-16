@@ -540,11 +540,13 @@ describe("hello capabilities advertisement", () => {
 			[
 				...CLIENT_FRAME_TYPES,
 				"tree-view-v1",
+				"tree-actions-v1",
 				"history-turns-v1",
 				"provider-catalog-v1",
 				"ping-id",
 				"model-scope-v1",
 				"provider-model-base-url-v1",
+				"prompt-disposition-v1",
 			].sort(),
 			"capabilities 必须与 ClientFrameType 全量一致",
 		);

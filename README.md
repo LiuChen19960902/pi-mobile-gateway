@@ -16,7 +16,7 @@ pi-mobile-gateway（本仓库，跑在 pi 同机）
 pi coding agent（会话与模型调用发生在电脑上，手机只是遥控器）
 ```
 
-两个监听面，安全边界靠**构造**保证而不是运行时检查：
+网关分为面向手机的数据面和仅限本机的管理面，并分别校验鉴权与来源：
 
 | 面 | 绑定 | 能力 |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 | 帧 | 说明 |
 | --- | --- |
 | `sessions` | 列出 pi 会话（id/路径/cwd/首条消息/运行中标记） |
-| `message` | 发送消息：续已有会话（`sessionId`）或新建（`cwd`）；`mode: prompt/steer/followUp` 对应 pi 的立即执行/插话/排队 |
+| `message` | 发送消息：续已有会话（`sessionId`）或新建（`cwd`）；空闲时直接执行；流式中 `steer` 插入本轮、`followUp` 排到下轮，`prompt` 或未指定模式则拒绝；SDK 正在压缩时拒绝发送 |
 | `subscribe` / `unsubscribe` | 订阅会话实时事件流（pi 事件 JSON 投影，单调 `seq`） |
 | `history` | 活动分支历史，支持按 turn 分页或条目游标分页，压缩感知 |
 | `state` | 轻量状态轮询（模型/思考等级/流式/队列/上下文占用） |
@@ -66,11 +66,12 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 | `models` / `set-model` | 可用模型按 Pi 全局 `settings.enabledModels` 范围过滤 / 切换（含 thinking 等级） |
 | `model-scope` / `model-scope-put` | 读取和设置 Pi 全局模型范围，保存具体模型 ID，不切换当前会话模型 |
 | `name` | 会话改名 |
-| `compact` | 手动触发上下文压缩 |
+| `compact` | 调用 Pi SDK 手动压缩，沿用宿主加载的压缩 hook；同会话重复触发合并 |
 | `providers` / `provider-put` / `provider-delete` | 手机端读写宿主 models.json（`apiKey` 盲存盲回，缺省保留） |
 | `provider-test` / `provider-models` | 逐模型协议与 Base URL 的上游连通性测试/ 拉取上游模型清单；两者会让网关向用户填写的 `baseUrl` 发起出站请求 |
 | `directories` / `directory-create` / `workspace-create` | 宿主目录浏览、新建文件夹、新会话落点 |
-| `tree` / `switch-branch` | 会话分支树与分支切换（需先 `subscribe` 打开会话） |
+| `tree` / `switch-branch` | Pi 会话树与活动位置切换（需先 `subscribe` 打开会话），支持搜索、筛选与折叠 |
+| `entry-copy` / `label-put` | 树页动作：整条 entry 的可复制全文（Pi Ctrl+X，>512 KiB 只报 `oversized`）/ 标签写（Pi Shift+L，需 live 会话；追加 `LabelEntry` 并推进叶子）；特性名 `tree-actions-v1` |
 | `restart-session` | 重建会话（对齐桌面 pi 重开语义） |
 | `commands` | 自定义命令清单（扩展/模板/skill 三源） |
 | `input-resources` / `input-completions` | 当前工作区的 Skill/Prompt 发现与 `@` 文件/目录补全 |
@@ -82,7 +83,7 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `GET /mgw/status` | 数据面端口、推断的公网地址、设备列表 |
+| `GET /mgw/status` | 数据面端口、推断的手机可达地址、设备列表 |
 | `POST /mgw/pair` | 签发配对码，body `{"name": "...", "publicUrl": "..."}`（均可选） |
 | `GET /mgw/devices` | 已配对设备与在线状态 |
 | `POST /mgw/devices/:id/revoke` | 吊销设备 |
@@ -118,7 +119,7 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 npm ci
 npm run typecheck
 npm test
-npm run lint    # 单独报告格式检查；既有存量格式问题尚未全部清理
+npm run lint
 ```
 
 手工 smoke（网关运行中）：
@@ -133,10 +134,9 @@ node scripts/smoke-verify.mjs --prompt                     # 附加一条真实�
 
 ## 限制
 
-- **验证环境是 Windows 上的 WSL2**（pi 与网关都跑在 WSL2 里，端口经 Windows 反射暴露给局域网/Tailscale）；
-  纯 Windows（不装 WSL）、macOS、裸 Linux 未验证，不承诺可用（网关是标准 node 服务，欢迎反馈实验结果）；
+- 日常验证环境为 Windows + WSL2。另在 Ubuntu 26.04.1 / x86_64 / Node.js 24.21.0（已配置 `fd`）验证过 gateway 0.3.0 的较早快照：安装、配对、Provider 配置、真实聊天、工具及历史主路径通过；最新树页动作和手动压缩未在该机复验。纯 Windows、macOS 和其他 Linux 环境未验证。
 
-- 图片附件、模型切换、分支导航、Provider 管理、目录浏览与输入补全已实现（见上方帧/说明表）；
+- 图片附件、模型切换、会话树导航、Provider 管理、目录浏览与输入补全已实现（见上方帧/说明表）；
 - 局域网明文 `ws://` 仅限可信网络；公网必须 `wss://` + 反向代理；
 - Provider API Key 由手机表单经 `provider-put` 写入宿主 models.json（网关盲存盲回、不做 OAuth/刷新）；
 - 扩展 UI 交互（`extension_ui_request`）由 pi 的 no-op 兜底自动取消，尚无移动端审批等价物。

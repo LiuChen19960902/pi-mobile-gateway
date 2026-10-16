@@ -7,6 +7,12 @@ import {
 	type WireMessage,
 } from "./wire.ts";
 
+export class HistoryCursorError extends Error {
+	constructor() {
+		super("历史位置已变化，请重新加载");
+	}
+}
+
 export class HistoryTurnPageTooLargeError extends Error {
 	constructor() {
 		super("单轮历史超过安全传输上限，无法完整加载；请在电脑端查看该轮");
@@ -22,7 +28,7 @@ export function historyTurnPage(
 	startLeafId?: string,
 ): HistoryPage {
 	const branch = sliceActiveBranchTail(entries, Number.MAX_SAFE_INTEGER, undefined, startLeafId);
-	if ("error" in branch) throw new Error("unknown history branch");
+	if ("error" in branch) throw new HistoryCursorError();
 	const groups: SessionEntry[][] = [];
 	let group: SessionEntry[] = [];
 	let hasUser = false;
@@ -49,7 +55,7 @@ export function historyTurnPage(
 	let end = groups.length;
 	if (beforeEntryId !== undefined) {
 		end = groups.findIndex((entries) => entries[0]?.id === beforeEntryId);
-		if (end < 0) throw new Error("unknown beforeEntryId or non-turn cursor");
+		if (end < 0) throw new HistoryCursorError();
 	}
 	let start = end;
 	let bytes = 0;

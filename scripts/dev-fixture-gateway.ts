@@ -19,7 +19,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
-import type { AgentSessionEvent, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent, PromptOptions, SessionManager } from "@earendil-works/pi-coding-agent";
 import { createRegistry } from "../src/devices.ts";
 import { startMgmtPlane } from "../src/mgmt.ts";
 import { encodePairingText } from "../src/pairing.ts";
@@ -77,7 +77,7 @@ class ScriptedSession implements PiSessionLike {
 		options?: {
 			streamingBehavior?: "steer" | "followUp";
 			images?: Array<{ type: "image"; data: string; mimeType: string }>;
-			preflightResult?: (success: boolean) => void;
+			preflightResult?: PromptOptions["preflightResult"];
 		},
 	): Promise<void> {
 		// Deterministic streaming turn, shaped like a real pi assistant run.
@@ -86,7 +86,11 @@ class ScriptedSession implements PiSessionLike {
 		// would land before the router's `sent` frame and invert the race the
 		// client must survive. Deltas are staggered so `abort()` has a live
 		// stream to interrupt.
-		options?.preflightResult?.(true);
+		if (text === "fixture:handled") {
+			options?.preflightResult?.("handled");
+			return Promise.resolve();
+		}
+		options?.preflightResult?.("started");
 		this.isStreaming = true;
 		// 与 pi 原生一致，但保持基线形状：text-only 请求 content 仍是 string；
 		// 带 images 时才升级为 [{type:"text",text}, ...images] 数组。图片随消息
@@ -142,6 +146,10 @@ class ScriptedSession implements PiSessionLike {
 		this.emit({ type: "agent_settled" } as AgentSessionEvent);
 		this.emit({ type: "agent_end", messages: [], willRetry: false } as AgentSessionEvent);
 		return Promise.resolve();
+	}
+
+	clearQueue(): { steering: string[]; followUp: string[] } {
+		return { steering: [], followUp: [] };
 	}
 
 	getSteeringMessages(): readonly string[] {

@@ -202,7 +202,9 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 								"subscribe",
 								"unsubscribe",
 								"message",
+								"prompt-disposition-v1",
 								"abort",
+								"dequeue",
 								"history",
 								"state",
 								"models",
@@ -227,6 +229,9 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 								"input-completions",
 								"tree",
 								"tree-view-v1",
+								"tree-actions-v1",
+								"entry-copy",
+								"label-put",
 								"history-turns-v1",
 								"provider-catalog-v1",
 								"ping-id",
@@ -236,10 +241,12 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 						: ["ping", "ping-id"]) satisfies (
 						| ClientFrameType
 						| "tree-view-v1"
+						| "tree-actions-v1"
 						| "history-turns-v1"
 						| "provider-catalog-v1"
 						| "model-scope-v1"
 						| "provider-model-base-url-v1"
+						| "prompt-disposition-v1"
 						| "ping-id"
 					)[],
 				},

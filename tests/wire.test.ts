@@ -206,28 +206,51 @@ describe("entryToWireMessage", () => {
 		const message = entryToWireMessage(entry as unknown as SessionEntry);
 		assert.equal(message?.role, "custom");
 		assert.equal(message?.customType, "compaction");
+		assert.equal(message?.entryType, "compaction");
 	});
 
-	it("converts empty-stop-retry custom entries to custom messages with details", () => {
-		const entry = {
-			type: "custom",
-			customType: "empty-stop-retry",
-			id: "e9",
-			parentId: "e8",
-			timestamp: "2026-01-01T00:00:00.000Z",
-			data: { attempt: 1, reason: "流错误: 401", model: "relayF/model-x" },
+	it("does not turn private custom entries into upstream errors", () => {
+		for (const customType of ["empty-stop-retry", "background-task"]) {
+			assert.equal(
+				entryToWireMessage({
+					type: "custom",
+					id: "private",
+					parentId: null,
+					customType,
+					data: { attempt: 1, reason: "internal state" },
+				} as unknown as SessionEntry),
+				null,
+			);
+		}
+	});
+
+	it("custom message source cannot impersonate native compaction", () => {
+		for (const display of [true, false]) {
+			const message = entryToWireMessage({
+				type: "custom_message",
+				id: "notice",
+				parentId: null,
+				customType: "compaction",
+				content: "public text",
+				display,
+				details: { tokensBefore: 1000 },
+				timestamp: "2026-01-01T00:00:00.000Z",
+			} as unknown as SessionEntry);
+			assert.equal(message?.entryType, "custom_message");
+			assert.equal(message?.display, display);
+			assert.equal(message?.content, "public text");
+		}
+	});
+
+	it("nested updates preserve their parent call without changing top-level updates", () => {
+		const event = {
+			type: "tool_execution_update",
+			toolCallId: "child",
+			parentToolCallId: "parent",
+			toolName: "read",
+			partialResult: { content: [{ type: "text", text: "partial" }] },
 		};
-		const message = entryToWireMessage(entry as unknown as SessionEntry) as {
-			role: string;
-			customType: string;
-			details: { attempt: number; reason: string };
-			timestamp?: number;
-		};
-		assert.equal(message.role, "custom");
-		assert.equal(message.customType, "empty-stop-retry");
-		assert.equal(message.details.attempt, 1);
-		assert.equal(message.details.reason, "流错误: 401");
-		assert.equal(message.timestamp, 1767225600000);
+		assert.deepEqual(toWireEvent(event as Parameters<typeof toWireEvent>[0]), event);
 	});
 
 	it("drops other custom event entries", () => {
@@ -481,6 +504,7 @@ describe("outbound size budget", () => {
 		const bytes = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
 		assert.ok(bytes <= WIRE_HISTORY_MESSAGE_MAX_BYTES);
 		assert.equal(sanitized.customType, "wire-oversized");
+		assert.equal(sanitized.entryType, "wire_oversized");
 	});
 });
 

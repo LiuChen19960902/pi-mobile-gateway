@@ -78,7 +78,13 @@ export interface ProviderUpsert {
 }
 
 /** Client-facing validation failure; the router echoes the message. */
-export class ProviderConfigError extends Error {}
+export class ProviderConfigError extends Error {
+	readonly code: string;
+	constructor(message: string, code = "bad-request") {
+		super(message);
+		this.code = code;
+	}
+}
 
 const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const MODEL_INPUT = ["text", "image"] as const;
@@ -419,7 +425,7 @@ export class PiProviderStore {
 		return this.enqueue(() => {
 			const previous = this.read();
 			const providers: Record<string, Record<string, unknown>> = { ...(previous.providers ?? {}) };
-			if (!(providerId in providers)) throw new ProviderConfigError(`provider 不存在: ${providerId}`);
+			if (!(providerId in providers)) throw new ProviderConfigError("Provider不存在", "provider-not-found");
 			delete providers[providerId];
 			this.write({ ...previous, providers });
 		});
@@ -442,7 +448,7 @@ export class PiProviderStore {
 			return parsed as RawModelsConfig;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return {};
-			throw new ProviderConfigError("models.json 读取失败，请检查文件格式");
+			throw new ProviderConfigError("模型配置读取失败", "provider-config-read-failed");
 		}
 	}
 
@@ -455,7 +461,7 @@ export class PiProviderStore {
 			writeFileSync(temporaryPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
 			renameSync(temporaryPath, path);
 		} catch {
-			throw new ProviderConfigError("models.json 写入失败");
+			throw new ProviderConfigError("模型配置保存失败", "provider-config-write-failed");
 		}
 	}
 }

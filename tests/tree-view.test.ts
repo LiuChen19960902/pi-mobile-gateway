@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readTreeView, type TreeViewOptions } from "../src/tree-view.ts";
+import {
+	entryCopyText,
+	LABEL_MAX_CHARS,
+	normalizeLabelValue,
+	readTreeView,
+	type TreeViewOptions,
+} from "../src/tree-view.ts";
 import { type PiTreeNode, toWireTreeNodes } from "../src/wire.ts";
 
 const view: TreeViewOptions = { filter: "default", search: "", foldedIds: [] };
@@ -156,4 +162,80 @@ test("view validation rejects malformed and unsupported options", () => {
 	assert.equal(readTreeView({ ...view, foldedIds: [1] }), null);
 	assert.equal(readTreeView({ ...view, search: 12 }), null);
 	assert.deepEqual(readTreeView(view), view);
+});
+
+// ---------------------------------------------------------------------------
+// entry-copy / label-put（PROTOCOL §4.26–§4.27）的纯语义层
+// ---------------------------------------------------------------------------
+
+test("entryCopyText mirrors Pi getEntryCopyText: full text per entry type, never the preview window", () => {
+	const long = `${"x".repeat(130)}needle${"x".repeat(4000)}`;
+	// user 字符串正文：全文返回，不取树行的 120/200 字窗口。
+	assert.equal(entryCopyText({ type: "message", message: { role: "user", content: long } }), long);
+	// 多 text 块拼接，非 text 块（图片/工具调用）不贡献文本。
+	assert.equal(
+		entryCopyText({
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "第一段\n" },
+					{ type: "image", data: "AAAA" },
+					{ type: "text", text: "第二段" },
+				],
+			},
+		}),
+		"第一段\n第二段",
+	);
+	// bashExecution 取命令行本身；toolResult 取其正文。
+	assert.equal(
+		entryCopyText({ type: "message", message: { role: "bashExecution", command: "ls -la /tmp" } }),
+		"ls -la /tmp",
+	);
+	assert.equal(
+		entryCopyText({
+			type: "message",
+			message: { role: "toolResult", toolName: "read", content: [{ type: "text", text: "file body" }] },
+		}),
+		"file body",
+	);
+	// assistant 无正文时回落 errorMessage；两者都没 → undefined（不造占位）。
+	assert.equal(
+		entryCopyText({ type: "message", message: { role: "assistant", content: [], errorMessage: "stream died" } }),
+		"stream died",
+	);
+	assert.equal(
+		entryCopyText({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "c" }] } }),
+		undefined,
+	);
+	assert.equal(entryCopyText({ type: "message", message: { role: "user", content: "   \n " } }), undefined);
+	// custom_message / compaction / branch_summary 各自的正文来源。
+	assert.equal(entryCopyText({ type: "custom_message", customType: "note", content: "body" }), "body");
+	assert.equal(entryCopyText({ type: "compaction", summary: "摘要全文", tokensBefore: 1000 }), "摘要全文");
+	assert.equal(entryCopyText({ type: "branch_summary", summary: "分支摘要" }), "分支摘要");
+	// 簿记条目没有可复制文本（Pi："Selected entry has no text to copy"）。
+	for (const entry of [
+		{ type: "label", targetId: "e1", label: "交付" },
+		{ type: "model_change", provider: "p", modelId: "m" },
+		{ type: "thinking_level_change", thinkingLevel: "high" },
+		{ type: "session_info", name: "标题" },
+		{ type: "usage", kind: "cache_warm" },
+		{ type: "context_edit", targetId: "e1", replacement: null },
+	]) {
+		assert.equal(entryCopyText(entry), undefined, JSON.stringify(entry));
+	}
+	// 与 Pi 一致：只有 trim 后非空才返回，且返回**未 trim** 的原文。
+	assert.equal(entryCopyText({ type: "compaction", summary: "\n  保留首尾空白  \n" }), "\n  保留首尾空白  \n");
+});
+
+test("normalizeLabelValue follows Pi LabelInput: trim, empty clears, oversized is a protocol violation", () => {
+	assert.deepEqual(normalizeLabelValue(undefined), { label: undefined });
+	assert.deepEqual(normalizeLabelValue(null), { label: undefined });
+	assert.deepEqual(normalizeLabelValue("   "), { label: undefined });
+	assert.deepEqual(normalizeLabelValue("\t交付 \n"), { label: "交付" });
+	assert.deepEqual(normalizeLabelValue("a".repeat(LABEL_MAX_CHARS)), { label: "a".repeat(LABEL_MAX_CHARS) });
+	assert.equal(normalizeLabelValue("a".repeat(LABEL_MAX_CHARS + 1)), null);
+	assert.equal(normalizeLabelValue(12), null);
+	assert.equal(normalizeLabelValue({ text: "x" }), null);
+	assert.equal(normalizeLabelValue(["x"]), null);
 });

@@ -8,7 +8,8 @@
 - 事件帧新增顶层 `entryId`（pi 条目身份）：在 pi emit→append 微任务窗口后按对象引用匹配 `SessionManager.getEntries()` 得出，history 平行 `entryIds` 对应；客户端据此做实时/历史消息身份合并。
 - `history` 未落盘窗口恢复：①会话尚无 assistant（首轮未落盘）②流式中 emit→append 间隙——当文件视图是 live 条目前缀时，把 live 尾部条目并入 history 并按 live 叶子切换活跃链；`latestEntryId` 并入时取 live 叶子。外部重写文件不满足前缀时不合并（不复活陈旧条目）。
 - `name` / `compact` 帧：会话改名（≤200 字符）、手动触发上下文压缩。
-- `tree` / `switch-branch` 帧：会话分支树（仅 user/assistant 可见节点、扁平布局、活跃路径高亮）与分支切换（对齐 pi TUI，固定 `summarize:false`；需先 `subscribe`）。
+- `tree` / `switch-branch` 帧：Pi 会话树（支持搜索、筛选、折叠与活跃路径高亮）及活动位置切换（对齐 pi TUI，固定 `summarize:false`；需先 `subscribe`）。
+- `entry-copy` / `label-put` 帧（特性名 `tree-actions-v1`）：树页动作接线。`entry-copy` 对齐 Pi TUI Ctrl+X 的 `getEntryCopyText`，回整条 entry 的可复制全文（不是 120 字预览）；无可复制文本回 `entry-copy-empty`，超 512 KiB 只回 `oversized`+`bytes`，不静默截断。`label-put` 对齐 Shift+L 的 `appendLabelChange`：只追加 `LabelEntry`（`targetId` 指向选中条目、最后记录生效、空值清除），写入后同步手动叶子钉子使 `tree` 的 `leafId`/`selectedId` 不错位；需 live 句柄，标签上限 200 字符。
 - `restart-session` 帧：重建会话并重读全部配置（对齐桌面 pi 重开语义；运行中拒绝）。
 - `commands` 帧：自定义命令清单（扩展/模板/skill 三源聚合）。
 - `providers` / `provider-put` / `provider-delete` / `provider-test` / `provider-models` 帧：手机端读写宿主 models.json、按协议连通性测试、拉取上游模型清单；`provider-test` 应答带 `failureKind`（网络类失败归 `transient`，不据以禁用 provider）。
@@ -18,10 +19,12 @@
 - `provider-put` 缺省语义：`name`/`baseUrl`/provider 级 `api` 缺省保留原值（原缺省清除）；`apiKey` 缺省保留不变；必填校验（`id`，`baseUrl`/`apiKey` 至少其一）不变。
 - `message images` 上限 8→4（与 18 MiB 帧上限的 4 张预算对齐，手机端同为 4）。
 - `provider-test` 的 `openai-responses` 协议改走 `/responses` 端点（`input`/`max_output_tokens`），与 pi-ai 实际请求一致；此前误走 `/chat/completions`。
-- `history` 分页参数改为 `limit`（原始条目计数），页大小由客户端决定（当前手机端 20 条/页）。
+- `history` 支持 `turnLimit`（最多 10 轮），并保留原始条目 `limit` / `beforeEntryId` 分页；单轮超出预算时客户端改用条目分页。
 
 ### Fixed
 
+- 手动压缩的启动等待也计入运行中状态，同会话重复触发合并；结束后排空 Pi 事件并通知最终状态，避免抽屉残留进行中。
+- 消息回执区分输入已消费与运行结束；停止和独立队列取回对齐 Pi 的 clearQueue / abort 语义。
 - 出站截断保持 UTF-16 代理对完整（`src/wire.ts` `truncateUtf16`）：正文（`WIRE_TEXT_MAX_CHARS`）、树预览（`TREE_PREVIEW_MAX_CHARS`）与 assistant 错误预览三处按 UTF-16 单元截断时，切点若落在有效代理对中间则退一单元，不再产生孤立代理（严格上游/客户端会拒收含孤立代理的整帧）。
 - `POST /mgw/devices/:id/revoke` 强制 `application/json`（缺省/错误类型 → 415），与 `/mgw/pair` 同口径。
 - `workspace-create` 已存在文件时报 `bad-request`“不是目录”（原 `internal`）。
@@ -59,12 +62,12 @@
 
 ## [0.2.1] - 2026-09-01
 
-独立评审修复（0 critical / 2 major / 7 minor）：并发正确性、出站体积预算、错误卫生与协议文档对齐。
+修复并发正确性、出站体积预算与错误信息问题，并对齐协议文档。
 
 ### Fixed
 
-- 并发加载同一会话（双击连发、多设备同时订阅）不再各自构建重复的 `AgentSession`：in-flight 去重锁保证共享一次构建，消除孤儿句柄（永不 dispose、订阅者收不到事件）与同 cwd 并发新建重复会话（major）。
-- 出站帧体积上限：实时事件帧超 1 MiB 先降损（图片 base64 → 元数据占位、超长文本截断）再降级为 `event_omitted` 存根；历史单条消息超 512 KiB 同样降损，仍超限替换为 `wire-oversized` 存根——"每页 2 MiB"分页契约不再被单条超大消息（图片附件/巨型工具输出）击穿（major）。
+- 并发加载同一会话（双击连发、多设备同时订阅）不再各自构建重复的 `AgentSession`：in-flight 去重锁保证共享一次构建，消除孤儿句柄（永不 dispose、订阅者收不到事件）与同 cwd 并发新建重复会话。
+- 出站帧体积上限：实时事件帧超 1 MiB 先降损（图片 base64 → 元数据占位、超长文本截断）再降级为 `event_omitted` 存根；历史单条消息超 512 KiB 同样降损，仍超限替换为 `wire-oversized` 存根——"每页 2 MiB"分页契约不再被单条超大消息（图片附件/巨型工具输出）击穿。
 - `message_update` 的 `usage` 改为从快照 `message.usage` 取（pi 自家投影语义；此前读不存在的顶层字段，流式 token 用量对手机不可见）；测试夹具改为真实 SDK 形状。
 - `beforeEntryId` 指向文件内存在、但不在活动分支上的条目时，现在明确报错，而不是静默返回祖先页。
 - `internal` 错误帧改为固定通用文案（原始错误只进网关日志，不再回显可能含文件路径的信息）。
@@ -106,7 +109,7 @@
 
 ### Fixed
 
-- 独立评审修复：畸形请求行不再使进程崩溃（未鉴权单包 DoS，critical）。
+- 畸形请求行不再使进程崩溃（未鉴权单包 DoS）。
 - 吊销设备现在立即关闭其全部在线连接（close code `4003`，移植 dsh 原版语义）。
 - 数据面恢复私网来源限制：非回环/私网来源返回 `403`，明文 `ws://` 不出私网。
 - 管理面恢复浏览器攻击防护：Host 白名单（防 DNS rebinding）、同源校验（防 CSRF）、POST 强制 `application/json`（`415` 阻断跨域简单请求）。

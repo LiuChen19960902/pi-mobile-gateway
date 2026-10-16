@@ -1,4 +1,6 @@
 import type { PromptOptions } from "@earendil-works/pi-coding-agent";
+import { HistoryCursorError } from "../src/history-turns.ts";
+import { DirectoryError } from "../src/host-fs.ts";
 // pi runtime 测试主要使用 fake 会话；真实工厂回归单独在临时配置子进程中执行。
 // 所有会话与配置均隔离，不调用真实模型，不读取用户 ~/.pi，不发网络请求。
 
@@ -23,6 +25,7 @@ import {
 	AttachmentInvalidError,
 	AttachmentNotFoundError,
 	AttachmentTooLargeError,
+	EntryNotFoundError,
 	ModelChangeError,
 	type ModelRegistryLike,
 	PiRuntime,
@@ -203,12 +206,20 @@ class FakeSession implements PiSessionLike {
 			: (this.allowedThinkingLevels?.[0] ?? level);
 	}
 
+	steeringMessages: string[] = ["queued-steer"];
+	followUpMessages: string[] = [];
 	getSteeringMessages(): readonly string[] {
-		return ["queued-steer"];
+		return this.steeringMessages;
 	}
-
 	getFollowUpMessages(): readonly string[] {
-		return [];
+		return this.followUpMessages;
+	}
+	clearQueue(): { steering: string[]; followUp: string[] } {
+		const removed = { steering: this.steeringMessages, followUp: this.followUpMessages };
+		this.steeringMessages = [];
+		this.followUpMessages = [];
+		this.emit({ type: "queue_update", steering: [], followUp: [] } as AgentSessionEvent);
+		return removed;
 	}
 
 	setSessionName(name: string): void {
@@ -573,9 +584,18 @@ describe("validateCwd", () => {
 		assert.equal(validateCwd(dir), dir);
 		const file = join(dir, "f.txt");
 		writeFileSync(file, "x");
-		assert.throws(() => validateCwd("relative/path"), /absolute/);
-		assert.throws(() => validateCwd(join(dir, "missing")), /does not exist/);
-		assert.throws(() => validateCwd(file), /not a directory/);
+		assert.throws(
+			() => validateCwd("relative/path"),
+			(e: unknown) => e instanceof DirectoryError && e.code === "bad-request",
+		);
+		assert.throws(
+			() => validateCwd(join(dir, "missing")),
+			(e: unknown) => e instanceof DirectoryError && e.code === "directory-not-found",
+		);
+		assert.throws(
+			() => validateCwd(file),
+			(e: unknown) => e instanceof DirectoryError && e.code === "directory-not-directory",
+		);
 	});
 });
 
@@ -689,7 +709,8 @@ describe("PiRuntime: prompt admission", () => {
 				});
 			};
 			let admitted = false;
-			const pending = runtime.prompt(handle, "hello", "prompt").then(() => {
+			const pending = runtime.prompt(handle, "hello", "prompt").then((acceptance) => {
+				assert.equal(acceptance.disposition, disposition);
 				admitted = true;
 			});
 			await new Promise((resolve) => setImmediate(resolve));
@@ -781,6 +802,63 @@ describe("PiRuntime: prompt admission", () => {
 			session.promptCalls.map((call) => call.mode),
 			[undefined, "followUp"],
 		);
+	});
+});
+
+describe("PiRuntime: dequeue without interrupting", () => {
+	it("restores the current queues only, in lane order, with a synchronous result callback", async () => {
+		const sessionDir = tempDir("pi-mgw-sessions-");
+		writeFixtureSession(sessionDir);
+		const { runtime, sessions } = fakeRuntime({ sessionDir });
+		await runtime.openSession(SESSION_ID);
+		const session = expectSession(sessions, SESSION_ID);
+		session.isStreaming = true;
+		session.steeringMessages = ["steer"];
+		session.followUpMessages = ["follow-up", "follow-up"];
+		let callbackRan = false;
+		const result = await runtime.dequeue(SESSION_ID, (queued, state) => {
+			callbackRan = true;
+			assert.deepEqual(queued, ["steer", "follow-up", "follow-up"]);
+			assert.equal(state.isStreaming, true);
+			assert.deepEqual(session.getFollowUpMessages(), []);
+		});
+		assert.equal(callbackRan, true);
+		assert.deepEqual(result.state.queuedMessages, { steering: [], followUp: [] });
+		assert.equal(session.aborted, false);
+		assert.equal(session.isStreaming, true);
+		assert.equal(session.promptCalls.length, 0);
+		assert.deepEqual((await runtime.dequeue(SESSION_ID)).queued, []);
+	});
+
+	it("waits for in-flight prompt admission; missing handles stay unloaded", async () => {
+		const sessionDir = tempDir("pi-mgw-sessions-");
+		writeFixtureSession(sessionDir);
+		const { runtime, sessions } = fakeRuntime({ sessionDir });
+		assert.deepEqual((await runtime.dequeue(SESSION_ID)).queued, []);
+		assert.equal(sessions.size, 0);
+		const handle = await runtime.openSession(SESSION_ID);
+		const session = expectSession(sessions, SESSION_ID);
+		session.steeringMessages = [];
+		let admit!: () => void;
+		session.onPrompt = async (_s, text, options) => {
+			await new Promise<void>((resolve) => {
+				admit = resolve;
+			});
+			session.followUpMessages.push(text);
+			options.preflightResult?.("queued");
+		};
+		const prompt = runtime.prompt(handle, "awaiting admission", "followUp");
+		await new Promise((resolve) => setImmediate(resolve));
+		let callbackRan = false;
+		const recall = runtime.dequeue(SESSION_ID, () => {
+			callbackRan = true;
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(callbackRan, false);
+		admit();
+		await prompt;
+		assert.deepEqual((await recall).queued, ["awaiting admission"]);
+		assert.equal(session.aborted, false);
 	});
 });
 
@@ -992,7 +1070,7 @@ describe("PiRuntime: history and state", () => {
 		const sessionDir = tempDir("pi-mgw-sessions-");
 		writeFixtureSession(sessionDir);
 		const { runtime } = fakeRuntime({ sessionDir });
-		await assert.rejects(() => runtime.history(SESSION_ID, "nope", 10), /beforeEntryId/);
+		await assert.rejects(() => runtime.history(SESSION_ID, "nope", 10), HistoryCursorError);
 	});
 
 	// 元数据页回归：limit 是原始 entries 预算，整页预算全被不渲染的元数据占满时
@@ -1791,6 +1869,61 @@ describe("PiRuntime: new sessions and lifecycle", () => {
 		assert.equal(expectSession(sessions, SESSION_ID).aborted, true);
 	});
 
+	it("takes queued text before abort and does not consume it twice", async () => {
+		const sessionDir = tempDir("pi-mgw-abort-");
+		writeFixtureSession(sessionDir);
+		const { runtime, sessions } = fakeRuntime({ sessionDir });
+		await runtime.openSession(SESSION_ID);
+		const session = expectSession(sessions, SESSION_ID);
+		session.steeringMessages = ["s"];
+		session.followUpMessages = ["f1", "f2"];
+		session.isStreaming = true;
+		const originalAbort = session.abort.bind(session);
+		session.abort = async () => {
+			assert.deepEqual(session.getSteeringMessages(), []);
+			assert.deepEqual(session.getFollowUpMessages(), []);
+			await originalAbort();
+		};
+		const result = await runtime.abort(SESSION_ID, true);
+		assert.deepEqual(result.queued, ["s", "f1", "f2"]);
+		assert.equal(result.state.isStreaming, false);
+		assert.deepEqual(result.state.queuedMessages, { steering: [], followUp: [] });
+		assert.deepEqual((await runtime.abort(SESSION_ID, true)).queued, []);
+		assert.equal(session.promptCalls.length, 0);
+	});
+
+	it("abort waits for an in-flight prompt admission before taking its follow-up", async () => {
+		const sessionDir = tempDir("pi-mgw-abort-admission-");
+		writeFixtureSession(sessionDir);
+		const { runtime, sessions } = fakeRuntime({ sessionDir });
+		const handle = await runtime.openSession(SESSION_ID);
+		const session = expectSession(sessions, SESSION_ID);
+		session.steeringMessages = [];
+		let admit!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			session.onPrompt = async (_session, text, options) => {
+				admit = () => {
+					session.followUpMessages.push(text);
+					options.preflightResult?.("queued");
+				};
+				resolve();
+				await new Promise<void>(() => {});
+			};
+		});
+		const prompt = runtime.prompt(handle, "pending", "followUp");
+		await entered;
+		let ended = false;
+		const stopping = runtime.abort(SESSION_ID, true).then((result) => {
+			ended = true;
+			return result;
+		});
+		await Promise.resolve();
+		assert.equal(ended, false);
+		admit();
+		await prompt;
+		assert.deepEqual((await stopping).queued, ["pending"]);
+	});
+
 	it("disposes idle subscriber-less handles on sweep and keeps running ones", async () => {
 		const sessionDir = tempDir("pi-mgw-sessions-");
 		writeFixtureSession(sessionDir);
@@ -2294,5 +2427,284 @@ describe("attachment (runtime)", () => {
 		await assert.rejects(runtime.attachment(SESSION_ID, "e6", 0), AttachmentTooLargeError);
 		await assert.rejects(runtime.attachment(SESSION_ID, "e3", 0), AttachmentInvalidError);
 		await assert.rejects(runtime.attachment(SESSION_ID, "e4", 0), AttachmentInvalidError);
+	});
+});
+
+it("prompt snapshot ACK cannot replay older lifecycle events after it", async () => {
+	const sessionDir = tempDir("pi-mgw-prompt-order-");
+	writeFixtureSession(sessionDir);
+	const { runtime, sessions } = fakeRuntime({ sessionDir });
+	const handle = await runtime.openSession(SESSION_ID);
+	const session = expectSession(sessions, SESSION_ID);
+	const frames: Array<Record<string, unknown>> = [];
+	handle.attach((frame) => frames.push(frame));
+	session.onPrompt = async (s, _text, options) => {
+		s.isStreaming = true;
+		s.emit({ type: "agent_start" } as AgentSessionEvent);
+		options.preflightResult?.("started");
+		await Promise.resolve();
+		s.isStreaming = false;
+		s.emit({ type: "agent_settled" } as AgentSessionEvent);
+	};
+	await runtime.prompt(handle, "fast", "prompt", [], (acceptance) => {
+		frames.push({ kind: "sent", ...acceptance.state });
+	});
+	await flushEvents();
+	let running = false;
+	for (const frame of frames) {
+		if (frame.kind === "sent") running = frame.isStreaming === true;
+		else if ((frame.event as { type?: string }).type === "agent_start") running = true;
+		else if ((frame.event as { type?: string }).type === "agent_settled") running = false;
+	}
+	assert.equal(running, false);
+	assert.equal(frames.filter((frame) => frame.kind === "sent").length, 1);
+});
+
+describe("PiRuntime: public custom message identity", () => {
+	for (const order of ["before", "after"] as const) {
+		it(`binds equal custom texts by SDK append order (${order} persistence)`, async () => {
+			const sessionDir = tempDir("pi-mgw-custom-id-");
+			writeFixtureSession(sessionDir);
+			let manager!: SessionManager;
+			let session!: FakeSession;
+			const runtime = new PiRuntime({
+				sessionDir,
+				enabledModelsLoader: () => undefined,
+				sessionFactory: async ({ sessionManager }) => {
+					manager = sessionManager;
+					// 历史同文不得被拿来匹配新消息。
+					manager.appendCustomMessageEntry("notice", "same", true);
+					session = new FakeSession(sessionManager);
+					return session;
+				},
+			});
+			runtimes.push(runtime);
+			const handle = await runtime.openSession(SESSION_ID);
+			const frames: Array<Record<string, unknown>> = [];
+			handle.attach((frame) => frames.push(frame));
+			const ids: string[] = [];
+			for (const display of [true, false, true]) {
+				const message = { role: "custom", customType: "compaction", content: "same", display, timestamp: 1 };
+				if (order === "before")
+					ids.push(manager.appendCustomMessageEntry(message.customType, message.content, display));
+				session.emit({ type: "message_start", message } as unknown as AgentSessionEvent);
+				if (order === "after") await flushEvents(); // 独立start批次不能占走未来身份。
+				session.emit({ type: "message_end", message } as unknown as AgentSessionEvent);
+				if (order === "after") ids.push(manager.appendCustomMessageEntry(message.customType, message.content, display));
+			}
+			await flushEvents();
+			const ends = frames.filter((frame) => (frame.event as { type: string }).type === "message_end");
+			assert.deepEqual(
+				ends.map((frame) => frame.entryId),
+				ids,
+			);
+			assert.equal(new Set(ids).size, 3);
+		});
+	}
+
+	it("does not guess custom IDs if extra unobserved entries make pairing ambiguous", async () => {
+		const sessionDir = tempDir("pi-mgw-custom-ambiguous-");
+		writeFixtureSession(sessionDir);
+		let manager!: SessionManager;
+		let session!: FakeSession;
+		const runtime = new PiRuntime({
+			sessionDir,
+			enabledModelsLoader: () => undefined,
+			sessionFactory: async ({ sessionManager }) => {
+				manager = sessionManager;
+				session = new FakeSession(manager);
+				return session;
+			},
+		});
+		runtimes.push(runtime);
+		const handle = await runtime.openSession(SESSION_ID);
+		const frames: Array<Record<string, unknown>> = [];
+		handle.attach((frame) => frames.push(frame));
+		manager.appendCustomMessageEntry("notice", "same", true);
+		manager.appendCustomMessageEntry("notice", "same", true);
+		session.emit({
+			type: "message_end",
+			message: { role: "custom", customType: "notice", content: "same", display: true },
+		} as unknown as AgentSessionEvent);
+		await flushEvents();
+		assert.equal(frames.length, 1);
+		assert.equal(frames[0].entryId, undefined);
+	});
+});
+
+it("real SDK idle custom messages retain unique live entry identities", () => {
+	const root = tempDir("pi-mgw-real-custom-");
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "project");
+	mkdirSync(agentDir);
+	mkdirSync(cwd);
+	writeFileSync(
+		join(agentDir, "models.json"),
+		JSON.stringify({
+			providers: {
+				synthetic: {
+					api: "openai-completions",
+					baseUrl: "http://127.0.0.1:9/v1",
+					apiKey: "synthetic-test-key",
+					models: [
+						{
+							id: "test",
+							name: "test",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 4096,
+							maxTokens: 256,
+						},
+					],
+				},
+			},
+		}),
+	);
+	writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["synthetic/test"] }));
+	const runtimeModule = new URL("../src/pi-runtime.ts", import.meta.url).href;
+	const script = `
+        import assert from 'node:assert/strict';
+        import { PiRuntime } from ${JSON.stringify(runtimeModule)};
+        globalThis.fetch = async () => { throw new Error('no model or network calls in this test'); };
+        const runtime = new PiRuntime({ agentDir: process.env.PI_CODING_AGENT_DIR,
+            sessionDir: process.env.PI_CODING_AGENT_DIR + '/sessions' });
+        try {
+            const handle = await runtime.createSession(process.cwd());
+            const frames = [];
+            handle.attach(frame => frames.push(frame));
+            for (const display of [true, false, true]) {
+                await handle.session.sendCustomMessage({ customType: 'compaction', content: 'same', display }, { triggerTurn: false });
+            }
+            await new Promise(resolve => setImmediate(resolve));
+            const entries = handle.session.sessionManager.getEntries().filter(entry => entry.type === 'custom_message');
+            const ends = frames.filter(frame => frame.event.type === 'message_end');
+            assert.deepEqual(ends.map(frame => frame.entryId), entries.map(entry => entry.id));
+            assert.equal(new Set(ends.map(frame => frame.entryId)).size, 3);
+            console.log(JSON.stringify({ messages: ends.length, uniqueIds: 3 }));
+        } finally { runtime.disposeAll(); }
+    `;
+	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+		cwd,
+		env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" },
+		encoding: "utf8",
+		timeout: 15_000,
+	});
+	assert.deepEqual(JSON.parse(output), { messages: 3, uniqueIds: 3 });
+});
+
+it("ordinary token batches never scan full session entries for custom identities", async () => {
+	const sessionDir = tempDir("pi-mgw-no-token-scan-");
+	writeFixtureSession(sessionDir);
+	let reads = 0;
+	let session!: FakeSession;
+	const runtime = new PiRuntime({
+		sessionDir,
+		enabledModelsLoader: () => undefined,
+		sessionFactory: async ({ sessionManager }) => {
+			const getEntries = sessionManager.getEntries.bind(sessionManager);
+			sessionManager.getEntries = () => {
+				reads += 1;
+				return getEntries();
+			};
+			session = new FakeSession(sessionManager);
+			return session;
+		},
+	});
+	runtimes.push(runtime);
+	const handle = await runtime.openSession(SESSION_ID);
+	const frames: Array<Record<string, unknown>> = [];
+	handle.attach((frame) => frames.push(frame));
+	reads = 0;
+	for (let i = 0; i < 5; i++) {
+		session.emit({
+			type: "message_update",
+			assistantMessageEvent: { type: "text_delta", delta: "token" },
+		} as unknown as AgentSessionEvent);
+		await flushEvents();
+	}
+	assert.equal(frames.length, 5);
+	assert.equal(reads, 0);
+});
+
+it("entry-copy 对尚未落盘的 live 会话报条目不存在，而不是会话不存在", async () => {
+	const { runtime } = fakeRuntime();
+	const handle = await runtime.createSession(tempDir("pi-entry-live-"));
+	await assert.rejects(runtime.entryCopy(handle.session.sessionId, "absent"), EntryNotFoundError);
+});
+
+it("首条会话消息落盘前的tree查询不丢有效live标签钉子", async () => {
+	const { runtime, sessions } = fakeRuntime();
+	const handle = await runtime.createSession(tempDir("pi-label-unflushed-"));
+	const id = handle.session.sessionId;
+	const session = expectSession(sessions, id);
+	const internals = runtime as unknown as {
+		manualLeafIds: Map<string, string>;
+		handles: Map<string, { sessionManager: SessionManager }>;
+	};
+	const manager = internals.handles.get(id)!.sessionManager;
+	const target = manager.appendModelChange("fixture", "m1");
+	const label = await runtime.putLabel(id, target, "待消息");
+	assert.ok(session.sessionFile);
+	// SDK1.0.4以第一条user或assistant为落盘门槛，元数据和标签不会触发首次落盘。
+	assert.equal(existsSync(session.sessionFile), false);
+	await runtime.tree(id);
+	assert.equal(internals.manualLeafIds.get(id), label.labelEntryId);
+	session.emitMessageEndThenAppend({ role: "user", content: "第一条消息" });
+	const messageId = session.appendedEntryIds.at(-1)!;
+	assert.equal(existsSync(session.sessionFile), true);
+	assert.equal((await runtime.tree(id)).leafId, messageId);
+});
+
+describe("manual compact invocation admission", () => {
+	it("coalesces startup retries and publishes an idle state after completion", async () => {
+		const { runtime, sessions } = fakeRuntime();
+		const handle = await runtime.createSession(tempDir("pi-compact-project-"));
+		const id = handle.session.sessionId;
+		const session = expectSession(sessions, id);
+		let complete!: () => void;
+		session.compact = () => {
+			session.compactCalls.push(undefined);
+			return new Promise<void>((resolve) => {
+				complete = resolve;
+			});
+		};
+		const frames: Record<string, unknown>[] = [];
+		handle.attach((frame) => frames.push(frame));
+		assert.equal((await runtime.beginCompact(id)).isCompacting, true);
+		assert.equal(session.isCompacting, false); // SDK尚在等待abort，不伪造原生状态。
+		assert.equal((await runtime.state(id)).isCompacting, true);
+		assert.equal((await runtime.beginCompact(id)).isCompacting, true);
+		assert.equal(session.compactCalls.length, 1);
+		await assert.rejects(runtime.restartSession(id));
+		complete();
+		await flushEvents();
+		assert.equal((await runtime.state(id)).isCompacting, false);
+		assert.ok(frames.some((f) => f.kind === "compact-finished" && f.isCompacting === false));
+		assert.equal((await runtime.beginCompact(id)).isCompacting, true);
+		assert.equal(session.compactCalls.length, 2);
+		complete();
+		await flushEvents();
+	});
+
+	it("releases an invocation that fails before SDK lifecycle events", async () => {
+		const { runtime, sessions } = fakeRuntime();
+		const handle = await runtime.createSession(tempDir("pi-compact-failure-"));
+		const session = expectSession(sessions, handle.session.sessionId);
+		const frames: Record<string, unknown>[] = [];
+		handle.attach((frame) => frames.push(frame));
+		session.compact = async () => {
+			throw new Error("synthetic startup failure");
+		};
+		assert.equal((await runtime.beginCompact(session.sessionId)).isCompacting, true);
+		await flushEvents();
+		assert.equal((await runtime.state(session.sessionId)).isCompacting, false);
+		assert.ok(frames.some((f) => f.kind === "compact-finished" && f.isCompacting === false));
+		session.compact = async () => {
+			session.compactCalls.push(undefined);
+		};
+		await runtime.beginCompact(session.sessionId);
+		await flushEvents();
+		assert.equal(session.compactCalls.length, 1);
 	});
 });

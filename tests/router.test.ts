@@ -53,7 +53,9 @@ class FakeSession implements PiSessionLike {
 	compactCalls: number = 0;
 	private listeners = new Set<(event: AgentSessionEvent) => void>();
 
+	readonly sessionManager: SessionManager;
 	constructor(sessionManager: SessionManager) {
+		this.sessionManager = sessionManager;
 		this.sessionId = sessionManager.getSessionId();
 		this.sessionFile = sessionManager.getSessionFile();
 	}
@@ -118,14 +120,20 @@ class FakeSession implements PiSessionLike {
 		return Promise.resolve();
 	}
 
+	steeringMessages: string[] = [];
+	followUpMessages: string[] = [];
 	getSteeringMessages(): readonly string[] {
 		return this.steeringMessages;
 	}
-
-	steeringMessages: string[] = [];
-
 	getFollowUpMessages(): readonly string[] {
-		return [];
+		return this.followUpMessages;
+	}
+	clearQueue(): { steering: string[]; followUp: string[] } {
+		const removed = { steering: this.steeringMessages, followUp: this.followUpMessages };
+		this.steeringMessages = [];
+		this.followUpMessages = [];
+		this.emit({ type: "queue_update", steering: [], followUp: [] } as AgentSessionEvent);
+		return removed;
 	}
 
 	/** Scripted navigateTree behavior; defaults to switching with no editor text. */
@@ -729,6 +737,347 @@ describe("router: model catalog and switching", () => {
 		client.close();
 	});
 
+	// -- tree 动作：entry-copy / label-put（PROTOCOL §4.26–§4.27）--------------
+
+	it("entry-copy 回整条 entry 全文（不是 preview），并如实报无可复制文本", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		// 只读端点：不先 set-model / subscribe 也能取（文件视图回落）。
+		client.send(JSON.stringify({ type: "entry-copy", sessionId: SESSION_ID, entryId: "e1" }));
+		const user = await client.nextMessage();
+		assert.equal(user.kind, "entry-copy");
+		assert.equal(user.sessionId, SESSION_ID);
+		assert.equal(user.entryId, "e1");
+		assert.equal(user.text, "hello");
+		assert.equal(user.bytes, Buffer.byteLength("hello", "utf8"));
+		assert.equal(user.oversized, undefined);
+		client.send(JSON.stringify({ type: "entry-copy", sessionId: SESSION_ID, entryId: "e2" }));
+		const assistant = await client.nextMessage();
+		assert.equal(assistant.text, "hi there");
+		// 簿记条目（model_change）没有可复制文本：专用错误码 + 完整关联，不造占位。
+		client.send(JSON.stringify({ type: "entry-copy", sessionId: SESSION_ID, entryId: "e0" }));
+		const empty = await client.nextMessage();
+		assert.equal(empty.kind, "error");
+		assert.equal(empty.code, "entry-copy-empty");
+		assert.equal(empty.requestType, "entry-copy");
+		assert.equal(empty.sessionId, SESSION_ID);
+		assert.equal(empty.entryId, "e0");
+		client.close();
+	});
+
+	it("entry-copy 超限只报 oversized+bytes，不静默截断当全文", async () => {
+		// 600 KiB 正文 > ENTRY_COPY_MAX_BYTES(512 KiB)：直接写 fixture，走真实文件视图。
+		const huge = "长".repeat(300 * 1024);
+		assert.ok(Buffer.byteLength(huge, "utf8") > 512 * 1024);
+		const harness = await startHarness({
+			extraFixture: (sessionDir) => {
+				const line = JSON.stringify({
+					type: "message",
+					id: "e_huge",
+					parentId: "e2",
+					message: { role: "user", content: huge },
+				});
+				appendFileSync(join(sessionDir, `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`), `${line}\n`);
+			},
+		});
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "entry-copy", sessionId: SESSION_ID, entryId: "e_huge" }));
+		const response = await client.nextMessage();
+		assert.equal(response.kind, "entry-copy");
+		assert.equal(response.oversized, true);
+		assert.equal(response.text, undefined, "超限不得回部分文本");
+		assert.equal(response.bytes, Buffer.byteLength(huge, "utf8"));
+		client.close();
+	});
+
+	it("entry-copy 拒绝未知会话/未知条目/缺参", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "entry-copy", sessionId: SESSION_ID, entryId: "ghost" }));
+		const missing = await client.nextMessage();
+		assert.equal(missing.code, "entry-not-found");
+		assert.equal(missing.entryId, "ghost");
+		client.send(
+			JSON.stringify({ type: "entry-copy", sessionId: "00000000-0000-4000-8000-000000000000", entryId: "e1" }),
+		);
+		assert.equal((await client.nextMessage()).code, "session-not-found");
+		for (const frame of [
+			{ type: "entry-copy" },
+			{ type: "entry-copy", sessionId: SESSION_ID },
+			{ type: "entry-copy", sessionId: SESSION_ID, entryId: "" },
+			{ type: "entry-copy", sessionId: SESSION_ID, entryId: "x".repeat(257) },
+		]) {
+			client.send(JSON.stringify(frame));
+			const response = await client.nextMessage();
+			assert.equal(response.code, "bad-request", JSON.stringify(frame).slice(0, 80));
+			assert.equal(response.requestType, "entry-copy");
+			// PROTOCOL §4.26：错误帧只在参数齐备时回显目标；缺参帧没有可回显的
+			// entryId，客户端据此不会把失败误归到某个动作卡（复审C钉住）。
+			if (frame.entryId === undefined) assert.equal(response.entryId, undefined);
+		}
+		client.close();
+	});
+
+	it("label-put 在 live 会话上追加/覆盖/清除标签，并跟着叶子前进", async () => {
+		// extraFixture 只用来拿到临时会话目录：后面要核落盘的 LabelEntry 父链。
+		let sessionDir = "";
+		const harness = await startHarness({
+			extraFixture: (dir) => {
+				sessionDir = dir;
+			},
+		});
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "set-model", sessionId: SESSION_ID, provider: "p2", modelId: "m2" }));
+		assert.equal((await client.nextMessage()).kind, "model-set");
+
+		// 新增：targetId 是被选中的 e1，新 LabelEntry 成为叶子。
+		client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: "交付" }));
+		const first = await client.nextMessage();
+		assert.equal(first.kind, "label-put");
+		assert.equal(first.entryId, "e1");
+		assert.equal(first.label, "交付");
+		assert.equal(typeof first.labelEntryId, "string");
+		assert.equal(first.leafId, first.labelEntryId, "Pi 语义：追加 LabelEntry 会推进叶子");
+		const firstLabelId = String(first.labelEntryId);
+
+		// 树投影跟着变：labeled-only 只留 e1，default 的 selectedId 回到最近可见祖先，
+		// 而不是把隐藏的标签条目当当前行（显示与跳转目标不错位）。
+		client.send(
+			JSON.stringify({
+				type: "tree",
+				sessionId: SESSION_ID,
+				view: { filter: "labeled-only", search: "", foldedIds: [] },
+			}),
+		);
+		const labeled = await client.nextMessage();
+		assert.deepEqual(
+			(labeled.nodes as Array<Record<string, unknown>>).map((node) => [node.id, node.label]),
+			[["e1", "交付"]],
+		);
+		client.send(
+			JSON.stringify({ type: "tree", sessionId: SESSION_ID, view: { filter: "default", search: "", foldedIds: [] } }),
+		);
+		const defaultView = await client.nextMessage();
+		assert.equal(defaultView.leafId, firstLabelId);
+		assert.equal(defaultView.selectedId, "e2", "叶子落在隐藏标签条目上时选择回落最近可见祖先");
+		// 复审A P2 的行为口径钉住（PROTOCOL §4.27 第4条）：all 筛选下 LabelEntry
+		// 是可见行且成为 leafId/selectedId——与 Pi 原生同语义，将来不得“修好”成回退旧叶。
+		client.send(
+			JSON.stringify({ type: "tree", sessionId: SESSION_ID, view: { filter: "all", search: "", foldedIds: [] } }),
+		);
+		const allView = await client.nextMessage();
+		assert.equal(allView.leafId, firstLabelId, "写标签后运行时叶子就是新 LabelEntry");
+		assert.equal(allView.selectedId, firstLabelId, "all 筛选下 LabelEntry 可见、不回退父链");
+		assert.ok(
+			(allView.nodes as Array<Record<string, unknown>>).some((node) => node.id === firstLabelId),
+			"all 筛选下新 LabelEntry 应投影成可见行",
+		);
+
+		// 覆盖：同一 target 再写一次，最后记录生效，新条目以上一个标签条目为父。
+		client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: " 已交付 " }));
+		const second = await client.nextMessage();
+		assert.equal(second.label, "已交付", "标签值按 Pi LabelInput 语义 trim");
+		assert.notEqual(second.labelEntryId, firstLabelId);
+		assert.equal(second.leafId, second.labelEntryId);
+
+		// 落盘核对：Pi 只追加不改写——三条 label 条目都以 e1 为 targetId，后一条的父是
+		// 前一条（运行时叶子已前进），旧消息行没被改写。
+		const lines = readFileSync(join(sessionDir, `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+		const labelEntries = lines.filter((entry) => entry.type === "label");
+		assert.deepEqual(
+			labelEntries.map((entry) => [entry.targetId, entry.label ?? null]),
+			[
+				["e1", "交付"],
+				["e1", "已交付"],
+			],
+		);
+		assert.equal(labelEntries[1].parentId, labelEntries[0].id);
+		assert.equal(lines.filter((entry) => entry.id === "e1").length, 1, "被标签的旧条目保持单份，不被改写");
+
+		// 清除：label 为 null / 缺席 / 空白串三种写法等价。
+		client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: null }));
+		const cleared = await client.nextMessage();
+		assert.equal(cleared.kind, "label-put");
+		assert.equal(cleared.label, null);
+		client.send(
+			JSON.stringify({
+				type: "tree",
+				sessionId: SESSION_ID,
+				view: { filter: "labeled-only", search: "", foldedIds: [] },
+			}),
+		);
+		const afterClear = await client.nextMessage();
+		assert.deepEqual(afterClear.nodes, []);
+		// 清除同样只追加：第三条 label 条目 label 字段为 undefined（Pi 的清除形态）。
+		const clearedLines = readFileSync(join(sessionDir, `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as Record<string, unknown>)
+			.filter((entry) => entry.type === "label");
+		assert.equal(clearedLines.length, 3);
+		assert.equal(clearedLines[2].label, undefined);
+		assert.equal(clearedLines[2].targetId, "e1");
+		client.close();
+	});
+
+	it("label-put 无 live 句柄/未知条目/非法标签均拒绝", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		// 未打开会话（无活动句柄）：与 switch-branch 同口径，不隐式 openSession。
+		client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: "x" }));
+		const offline = await client.nextMessage();
+		assert.equal(offline.kind, "error");
+		assert.equal(offline.code, "session-not-found");
+		assert.equal(offline.requestType, "label-put");
+
+		client.send(JSON.stringify({ type: "set-model", sessionId: SESSION_ID, provider: "p2", modelId: "m2" }));
+		assert.equal((await client.nextMessage()).kind, "model-set");
+		client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "ghost", label: "x" }));
+		const missing = await client.nextMessage();
+		assert.equal(missing.code, "entry-not-found");
+		assert.equal(missing.entryId, "ghost");
+		for (const frame of [
+			{ type: "label-put", sessionId: SESSION_ID },
+			{ type: "label-put", sessionId: SESSION_ID, entryId: "" },
+			{ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: 12 },
+			{ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: "a".repeat(201) },
+		]) {
+			client.send(JSON.stringify(frame));
+			const response = await client.nextMessage();
+			assert.equal(response.code, "bad-request", JSON.stringify(frame).slice(0, 80));
+			assert.equal(response.requestType, "label-put");
+			// 同 entry-copy：缺参帧不回显 entryId（PROTOCOL §4.27）。
+			if (frame.entryId === undefined) assert.equal(response.entryId, undefined);
+		}
+		client.close();
+	});
+
+	// PROTOCOL §4.27 第6条：流式/压缩进行中不额外拒绝（Pi 也允许在树选择器里改标签），
+	// 复审C指出该承诺零测试——这里钉住，将来加 busy 拒绝会红。
+	it("label-put 持久化异常不伪报 entry-not-found，也不回成功", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		try {
+			client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+			await client.nextMessage();
+			const session = expectSession(harness.sessions, SESSION_ID);
+			const before = session.sessionManager.getLeafId();
+			session.sessionManager.appendLabelChange = () => {
+				throw new Error("synthetic-disk-full");
+			};
+			client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: "交付" }));
+			const response = await client.nextMessage();
+			assert.equal(response.kind, "error");
+			assert.equal(response.code, "internal");
+			assert.equal(response.message, "internal error");
+			assert.equal(response.entryId, "e1");
+			assert.equal(session.sessionManager.getLeafId(), before);
+		} finally {
+			client.close();
+		}
+	});
+
+	it("label-put 后自然追加的回答仍是当前叶子，句柄回收后也保留", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		try {
+			client.send(JSON.stringify({ type: "set-model", sessionId: SESSION_ID, provider: "p2", modelId: "m2" }));
+			await client.nextMessage();
+			const session = expectSession(harness.sessions, SESSION_ID);
+			session.isStreaming = true;
+			client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: "流式中" }));
+			const label = await client.nextMessage();
+			assert.equal(label.kind, "label-put");
+			const answer = session.sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: "标签之后完成的回答" }],
+				api: "anthropic-messages",
+				provider: "fixture",
+				model: "m1",
+				timestamp: Date.now(),
+				stopReason: "stop",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			});
+			session.isStreaming = false;
+			client.send(
+				JSON.stringify({ type: "tree", sessionId: SESSION_ID, view: { filter: "all", search: "", foldedIds: [] } }),
+			);
+			assert.equal((await client.nextMessage()).leafId, answer);
+			// 再追加后不先读tree，直接回收，覆盖回收前同步路径。
+			const next = session.sessionManager.appendMessage({ role: "user", content: "后续", timestamp: Date.now() });
+			harness.runtime.disposeAll();
+			client.send(
+				JSON.stringify({ type: "tree", sessionId: SESSION_ID, view: { filter: "all", search: "", foldedIds: [] } }),
+			);
+			assert.equal((await client.nextMessage()).leafId, next);
+			client.send(JSON.stringify({ type: "history", sessionId: SESSION_ID }));
+			const history = await client.nextMessage();
+			assert.equal(history.latestEntryId, next);
+			assert.ok((history.entryIds as string[]).includes(answer));
+		} finally {
+			client.close();
+		}
+	});
+
+	it("live全文复制与压缩中标签写保留Pi语义，覆盖标签即时进入筛选", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		try {
+			client.send(JSON.stringify({ type: "set-model", sessionId: SESSION_ID, provider: "p2", modelId: "m2" }));
+			await client.nextMessage();
+			const session = expectSession(harness.sessions, SESSION_ID);
+			client.send(JSON.stringify({ type: "entry-copy", sessionId: SESSION_ID, entryId: "e1" }));
+			const copied = await client.nextMessage();
+			assert.equal(copied.kind, "entry-copy");
+			assert.equal(copied.text, "hello");
+			session.isCompacting = true;
+			for (const label of ["旧标签", "新标签"]) {
+				client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label }));
+				assert.equal((await client.nextMessage()).label, label);
+			}
+			session.isCompacting = false;
+			client.send(
+				JSON.stringify({
+					type: "tree",
+					sessionId: SESSION_ID,
+					view: { filter: "labeled-only", search: "", foldedIds: [] },
+				}),
+			);
+			const tree = await client.nextMessage();
+			assert.equal(
+				(tree.nodes as Array<{ id: string; label?: string }>).find((node) => node.id === "e1")?.label,
+				"新标签",
+			);
+		} finally {
+			client.close();
+		}
+	});
+
+	it("label-put 流式中不额外拒绝，正常追加", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "set-model", sessionId: SESSION_ID, provider: "p2", modelId: "m2" }));
+		assert.equal((await client.nextMessage()).kind, "model-set");
+		const session = expectSession(harness.sessions, SESSION_ID);
+		session.isStreaming = true;
+		client.send(JSON.stringify({ type: "label-put", sessionId: SESSION_ID, entryId: "e1", label: "流式中" }));
+		const response = await client.nextMessage();
+		assert.equal(response.kind, "label-put");
+		assert.equal(response.label, "流式中");
+		assert.equal(typeof response.labelEntryId, "string");
+		client.close();
+	});
+
 	it("restarts an idle session and rejects a busy one", async () => {
 		const harness = await startHarness();
 		const client = await harness.connectPaired();
@@ -784,6 +1133,8 @@ describe("router: model catalog and switching", () => {
 	it("starts manual compaction without awaiting its completion", async () => {
 		const harness = await startHarness();
 		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+		assert.equal((await client.nextMessage()).kind, "subscribed");
 		client.send(JSON.stringify({ type: "compact", sessionId: SESSION_ID }));
 		const response = await client.nextMessage();
 		assert.equal(response.kind, "compact-started");
@@ -792,6 +1143,10 @@ describe("router: model catalog and switching", () => {
 		const session = harness.sessions.get(SESSION_ID);
 		assert.ok(session);
 		assert.equal(session.compactCalls, 1);
+		assert.equal(response.isCompacting, true);
+		const finalState = await client.nextMessage();
+		assert.equal(finalState.kind, "compact-finished");
+		assert.equal(finalState.isCompacting, false);
 		client.close();
 	});
 
@@ -1011,15 +1366,15 @@ describe("router: message flow and events", () => {
 			],
 			[{ type: "message", sessionId: SESSION_ID, cwd: "/tmp", text: "x" }, "not both"],
 			[{ type: "message", text: "x" }, "requires"],
-			[{ type: "message", cwd: "relative", text: "x" }, "absolute"],
-			[{ type: "message", cwd: "/definitely/missing/dir", text: "x" }, "does not exist"],
+			[{ type: "message", cwd: "relative", text: "x" }, "绝对路径"],
+			[{ type: "message", cwd: "/definitely/missing/dir", text: "x" }, "目录不存在"],
 			[{ type: "message", sessionId: SESSION_ID, text: "x", mode: "queue" }, "mode"],
 		];
 		for (const [frame, needle] of cases) {
 			client.send(JSON.stringify(frame));
 			const response = await client.nextMessage();
 			assert.equal(response.kind, "error", JSON.stringify(frame));
-			assert.equal(response.code, "bad-request");
+			assert.equal(response.code, frame.cwd === "/definitely/missing/dir" ? "directory-not-found" : "bad-request");
 			assert.ok(
 				String(response.message).includes(needle),
 				`message "${String(response.message)}" should mention "${needle}"`,
@@ -1276,6 +1631,51 @@ describe("router: subscriptions", () => {
 		reopened.close();
 	});
 
+	it("dequeue restores both pending queues without aborting; ACK precedes later queue events", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+		await client.nextMessage();
+		const session = expectSession(harness.sessions, SESSION_ID);
+		session.isStreaming = true;
+		session.steeringMessages = ["first"];
+		session.followUpMessages = ["next", "next"];
+		client.send(JSON.stringify({ type: "dequeue", sessionId: SESSION_ID, queueRequestId: "recall-1" }));
+		const reply = await client.nextMessage();
+		assert.equal(reply.kind, "dequeued");
+		assert.equal(reply.queueRequestId, "recall-1");
+		assert.equal(reply.isStreaming, true);
+		assert.deepEqual(reply.queued, ["first", "next", "next"]);
+		assert.deepEqual(reply.queuedMessages, { steering: [], followUp: [] });
+		assert.equal(session.aborted, false);
+		assert.equal(session.promptCalls.length, 0);
+		assert.equal((await client.nextMessage()).kind, "event");
+		client.send(JSON.stringify({ type: "dequeue", sessionId: SESSION_ID, queueRequestId: "recall-2" }));
+		assert.deepEqual((await client.nextMessage()).queued, []);
+		await client.nextMessage();
+		client.close();
+	});
+
+	it("dequeue rejects missing/invalid operation ID before clearing anything", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+		await client.nextMessage();
+		const session = expectSession(harness.sessions, SESSION_ID);
+		session.followUpMessages = ["keep"];
+		for (const queueRequestId of [undefined, " ", "x".repeat(129), 1]) {
+			client.send(JSON.stringify({ type: "dequeue", sessionId: SESSION_ID, queueRequestId }));
+			assert.equal((await client.nextMessage()).code, "bad-request");
+			assert.deepEqual(session.getFollowUpMessages(), ["keep"]);
+		}
+		client.send(JSON.stringify({ type: "dequeue", queueRequestId: "missing-session" }));
+		const failure = await client.nextMessage();
+		assert.equal(failure.code, "bad-request");
+		assert.equal(failure.queueRequestId, "missing-session");
+		assert.equal(session.aborted, false);
+		client.close();
+	});
+
 	it("abort reports aborted for loaded sessions", async () => {
 		const harness = await startHarness();
 		const client = await harness.connectPaired();
@@ -1284,6 +1684,50 @@ describe("router: subscriptions", () => {
 		client.send(JSON.stringify({ type: "abort", sessionId: SESSION_ID }));
 		assert.equal((await client.nextMessage()).kind, "aborted");
 		assert.equal(expectSession(harness.sessions, SESSION_ID).aborted, true);
+		client.close();
+	});
+
+	it("opt-in abort clears idle residual queue and returns text once before accepting new messages", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+		await client.nextMessage();
+		const session = expectSession(harness.sessions, SESSION_ID);
+		session.steeringMessages = ["first"];
+		session.followUpMessages = ["next", "next"];
+		client.send(JSON.stringify({ type: "abort", sessionId: SESSION_ID, restoreQueued: true }));
+		const update = await client.nextMessage();
+		assert.equal(update.kind, "event");
+		assert.deepEqual((update.event as Record<string, unknown>).followUp, []);
+		const reply = await client.nextMessage();
+		assert.equal(reply.kind, "aborted");
+		assert.equal(reply.isStreaming, false);
+		assert.equal(reply.isCompacting, false);
+		assert.deepEqual(reply.queued, ["first", "next", "next"]);
+		assert.deepEqual(reply.queuedMessages, { steering: [], followUp: [] });
+		assert.deepEqual(session.getFollowUpMessages(), []);
+		assert.equal(session.promptCalls.length, 0);
+		client.send(JSON.stringify({ type: "abort", sessionId: SESSION_ID, restoreQueued: true }));
+		await client.nextMessage(); // empty queue_update
+		assert.deepEqual((await client.nextMessage()).queued, []);
+		client.close();
+	});
+
+	it("legacy abort keeps queued text; invalid opt-in cannot clear it", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+		await client.nextMessage();
+		const session = expectSession(harness.sessions, SESSION_ID);
+		session.followUpMessages = ["keep"];
+		client.send(JSON.stringify({ type: "abort", sessionId: SESSION_ID, restoreQueued: "true" }));
+		assert.equal((await client.nextMessage()).kind, "error");
+		assert.equal(session.aborted, false);
+		client.send(JSON.stringify({ type: "abort", sessionId: SESSION_ID }));
+		const reply = await client.nextMessage();
+		assert.equal(reply.kind, "aborted");
+		assert.equal(reply.queued, undefined);
+		assert.deepEqual(session.getFollowUpMessages(), ["keep"]);
 		client.close();
 	});
 
@@ -1353,23 +1797,21 @@ function writeHugeMessageFixture(sessionDir: string): void {
 }
 
 describe("router: review round", () => {
-	it("internal errors return a fixed generic message and log the detail", async () => {
+	it("invalid history cursor returns a safe category without exposing the cursor", async () => {
 		const harness = await startHarness({ extraFixture: writeAbandonedBranchFixture });
 		harness.logs.length = 0;
 		const client = await harness.connectPaired();
 		// The cursor exists in the file but sits on an abandoned branch:
-		// runtime.history throws; the router must degrade it to `internal`.
+		// runtime.history returns a stable cursor category without private details.
 		client.send(JSON.stringify({ type: "history", sessionId: ABANDONED_SESSION_ID, beforeEntryId: "e1a" }));
 		const response = await client.nextMessage();
 		assert.equal(response.kind, "error");
-		assert.equal(response.code, "internal");
-		assert.equal(response.message, "internal error");
+		assert.equal(response.code, "history-cursor-invalid");
+		assert.equal(response.message, "历史位置已变化，请重新加载");
 		assert.equal(response.sessionId, ABANDONED_SESSION_ID);
 		assert.equal(response.requestType, "history");
-		assert.ok(
-			harness.logs.some((line) => line.includes("beforeEntryId")),
-			"detail goes to the log, not the client",
-		);
+		assert.equal(JSON.stringify(response).includes("e1a"), false);
+		assert.ok(harness.logs.includes("history cursor invalid"));
 		// The normal page for that session still works.
 		client.send(JSON.stringify({ type: "history", sessionId: ABANDONED_SESSION_ID }));
 		const page = await client.nextMessage();
@@ -1456,7 +1898,7 @@ describe("router: workspace picker (host fs services)", () => {
 		client.close();
 	});
 
-	it("rejects relative paths, missing directories and illegal names with bad-request", async () => {
+	it("distinguishes invalid paths, missing directories and illegal names", async () => {
 		const harness = await startHarness();
 		const client = await harness.connectPaired();
 
@@ -1469,12 +1911,12 @@ describe("router: workspace picker (host fs services)", () => {
 		client.send(JSON.stringify({ type: "directories", path: "/nonexistent-dir-xyz" }));
 		response = (await client.nextMessage()) as Record<string, unknown>;
 		assert.equal(response.kind, "error");
-		assert.equal(response.code, "bad-request");
+		assert.equal(response.code, "directory-not-found");
 
 		client.send(JSON.stringify({ type: "directory-create", path: "/", name: "../escape" }));
 		response = (await client.nextMessage()) as Record<string, unknown>;
 		assert.equal(response.kind, "error");
-		assert.equal(response.code, "bad-request");
+		assert.equal(response.code, "directory-name-invalid");
 		assert.equal(response.requestType, "directory-create");
 
 		client.send(JSON.stringify({ type: "workspace-create", path: "not-absolute" }));
@@ -1521,7 +1963,7 @@ describe("router: provider management (models.json)", () => {
 		client.send(JSON.stringify({ type: "provider-delete", id: "relayA" }));
 		const missing = await client.nextMessage();
 		assert.equal(missing.kind, "error");
-		assert.equal(missing.code, "bad-request");
+		assert.equal(missing.code, "provider-not-found");
 		client.close();
 	});
 

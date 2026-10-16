@@ -32,6 +32,7 @@ export const CLIENT_FRAME_TYPES = [
 	"unsubscribe",
 	"message",
 	"abort",
+	"dequeue",
 	"history",
 	"state",
 	"models",
@@ -51,6 +52,8 @@ export const CLIENT_FRAME_TYPES = [
 	"restart-session",
 	"tree",
 	"switch-branch",
+	"entry-copy",
+	"label-put",
 	"commands",
 	"input-resources",
 	"input-completions",
@@ -245,6 +248,7 @@ export function toWireEvent(event: AgentSessionEvent): Record<string, unknown> |
 			toolCallId: raw.toolCallId,
 			toolName: raw.toolName,
 			partialResult: raw.partialResult,
+			...(typeof raw.parentToolCallId === "string" ? { parentToolCallId: raw.parentToolCallId } : {}),
 		};
 	}
 
@@ -320,6 +324,7 @@ export function entryToWireMessage(entry: SessionEntry): WireMessage | null {
 		case "compaction":
 			return {
 				role: "custom",
+				entryType: "compaction",
 				customType: "compaction",
 				content: raw.summary,
 				display: true,
@@ -338,18 +343,11 @@ export function entryToWireMessage(entry: SessionEntry): WireMessage | null {
 			};
 		}
 		case "custom":
-			// 只有 empty-stop-retry 还原成消息：历史重建时客户端要渲染"上游错误"提示
-			// （与实时侧的 entry_appended 归一一致）。其他 custom 事件 entry 不是消息。
-			if (raw.customType !== "empty-stop-retry") return null;
-			return {
-				role: "custom",
-				customType: raw.customType,
-				details: raw.data,
-				timestamp: parseEntryTimestamp(String(raw.timestamp ?? "")),
-			};
+			return null; // Pi内部数据不是可见消息，不解释插件私有类型。
 		case "custom_message":
 			return {
 				role: "custom",
+				entryType: "custom_message",
 				customType: raw.customType,
 				content: raw.content,
 				display: raw.display,
@@ -605,6 +603,7 @@ export function oversizedMessageStub(bytes: number): WireMessage {
 	return {
 		role: "custom",
 		customType: "wire-oversized",
+		entryType: "wire_oversized",
 		content: "[消息过大，移动端已省略]",
 		display: true,
 		originalBytes: bytes,

@@ -1,6 +1,6 @@
-import { HistoryTurnPageTooLargeError } from "./history-turns.ts";
+import { HistoryCursorError, HistoryTurnPageTooLargeError } from "./history-turns.ts";
 import { createInputAssist } from "./input-assist.ts";
-import { readTreeView } from "./tree-view.ts";
+import { LABEL_MAX_CHARS, normalizeLabelValue, readTreeView } from "./tree-view.ts";
 // Business-frame router: one instance per authenticated client connection.
 //
 // The transport plane (server.ts) hands every post-handshake JSON frame here
@@ -13,11 +13,13 @@ import { readTreeView } from "./tree-view.ts";
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createDirectory, createWorkspaceAt, DirectoryError, listDirectories } from "./host-fs.ts";
+import { classifyDirectoryError, createDirectory, createWorkspaceAt, listDirectories } from "./host-fs.ts";
 import {
 	AttachmentInvalidError,
 	AttachmentNotFoundError,
 	AttachmentTooLargeError,
+	EntryCopyEmptyError,
+	EntryNotFoundError,
 	type ImageAttachment,
 	MAXIMUM_MESSAGE_IMAGES,
 	ModelChangeError,
@@ -134,12 +136,26 @@ function attachmentError(
 	return { kind: "error", code, message, requestType: "attachment", sessionId, entryId, imageIndex };
 }
 
+/** tree 动作（entry-copy / label-put）的错误帧：统一 error 骨架 + entryId 关联，
+ * 与 attachment 同口径（§4.26/§4.27）；未知异常的细节只进日志。 */
+function treeActionError(
+	code: string,
+	message: string,
+	requestType: string,
+	sessionId: string | undefined,
+	entryId: string | undefined,
+): Record<string, unknown> {
+	return {
+		...errorFrame(code, message, requestType, sessionId),
+		...(entryId !== undefined ? { entryId } : {}),
+	};
+}
+
 /** Validation failures from host-fs carry client-safe messages; anything else
  * is logged with detail and answered with the fixed generic frame. */
 function directoryErrorFrame(error: unknown, requestType: string): Record<string, unknown> {
-	if (error instanceof DirectoryError) {
-		return errorFrame("bad-request", error.message, requestType);
-	}
+	const classified = classifyDirectoryError(error);
+	if (classified) return errorFrame(classified.code, classified.message, requestType);
 	throw error;
 }
 
@@ -147,7 +163,7 @@ function directoryErrorFrame(error: unknown, requestType: string): Record<string
  * validation/IO messages echo back, everything else stays internal. */
 function providerErrorFrame(error: unknown, requestType: string): Record<string, unknown> {
 	if (error instanceof ProviderConfigError) {
-		return errorFrame("bad-request", error.message, requestType);
+		return errorFrame(error.code, error.message, requestType);
 	}
 	throw error;
 }
@@ -387,7 +403,7 @@ export function connectClient(
 						try {
 							handle = await runtime.createSession(validateCwd(cwd as string));
 						} catch (error) {
-							send(errorFrame("bad-request", error instanceof Error ? error.message : String(error), "message"));
+							send(directoryErrorFrame(error, "message"));
 							return;
 						}
 					}
@@ -421,7 +437,10 @@ export function connectClient(
 					}
 					try {
 						log(`message: prompt entering (bytes=text:${text.length}, images:${imageAttachments.length})`);
-						await runtime.prompt(handle, text, mode, imageAttachments);
+						await runtime.prompt(handle, text, mode, imageAttachments, (acceptance) => {
+							log(`message: sending sent`);
+							send({ kind: "sent", mode, disposition: acceptance.disposition, ...acceptance.state });
+						});
 						log(`message: prompt resolved`);
 					} catch (error) {
 						// Prompt-level failures are validation/preflight
@@ -438,8 +457,27 @@ export function connectClient(
 						);
 						return;
 					}
-					log(`message: sending sent`);
-					send({ kind: "sent", sessionId: resolvedId, mode });
+					return;
+				}
+
+				case "dequeue": {
+					const sessionId = asString(frame, "sessionId");
+					const queueRequestId = asString(frame, "queueRequestId");
+					if (!sessionId || !queueRequestId || queueRequestId.length > 128) {
+						send({
+							...errorFrame("bad-request", "dequeue requires sessionId and queueRequestId", "dequeue", sessionId),
+							...(queueRequestId && queueRequestId.length <= 128 ? { queueRequestId } : {}),
+						});
+						return;
+					}
+					try {
+						await runtime.dequeue(sessionId, (queued, state) => {
+							send({ kind: "dequeued", ...state, queued, queueRequestId });
+						});
+					} catch (error) {
+						log(`internal error handling dequeue frame: ${String(error)}`);
+						send({ ...errorFrame("internal", "internal error", "dequeue", sessionId), queueRequestId });
+					}
 					return;
 				}
 
@@ -449,8 +487,16 @@ export function connectClient(
 						send(errorFrame("bad-request", "abort requires a sessionId", "abort"));
 						return;
 					}
-					await runtime.abort(sessionId);
-					send({ kind: "aborted", sessionId });
+					if (frame.restoreQueued !== undefined && typeof frame.restoreQueued !== "boolean") {
+						send(errorFrame("bad-request", "restoreQueued must be boolean", "abort", sessionId));
+						return;
+					}
+					const result = await runtime.abort(sessionId, frame.restoreQueued === true);
+					send({
+						kind: "aborted",
+						...result.state,
+						...(frame.restoreQueued === true ? { queued: result.queued } : {}),
+					});
 					return;
 				}
 
@@ -559,6 +605,86 @@ export function connectClient(
 					const result = await runtime.switchBranch(sessionId, entryId);
 					const { state, ...rest } = result;
 					send({ kind: "branch-switched", ...rest, ...state, sessionId });
+					return;
+				}
+
+				// -- tree 动作：整条 entry 复制 / 标签写（§4.26–§4.27）----------
+
+				case "entry-copy": {
+					const sessionId = asString(frame, "sessionId");
+					const entryId = asString(frame, "entryId");
+					if (!sessionId || !entryId || sessionId.length > 256 || entryId.length > 256) {
+						send(
+							treeActionError(
+								"bad-request",
+								"entry-copy requires bounded sessionId and entryId",
+								"entry-copy",
+								sessionId,
+								entryId,
+							),
+						);
+						return;
+					}
+					try {
+						const result = await runtime.entryCopy(sessionId, entryId);
+						send({ kind: "entry-copy", ...result });
+					} catch (error) {
+						if (error instanceof SessionNotFoundError) {
+							send(treeActionError("session-not-found", error.message, "entry-copy", sessionId, entryId));
+						} else if (error instanceof EntryNotFoundError) {
+							send(treeActionError("entry-not-found", "条目不存在，请刷新会话树", "entry-copy", sessionId, entryId));
+						} else if (error instanceof EntryCopyEmptyError) {
+							send(treeActionError("entry-copy-empty", "该条目没有可复制的文本", "entry-copy", sessionId, entryId));
+						} else {
+							log(`internal error handling entry-copy frame: ${String(error)}`);
+							send(treeActionError("internal", "internal error", "entry-copy", sessionId, entryId));
+						}
+					}
+					return;
+				}
+
+				case "label-put": {
+					const sessionId = asString(frame, "sessionId");
+					const entryId = asString(frame, "entryId");
+					if (!sessionId || !entryId || sessionId.length > 256 || entryId.length > 256) {
+						send(
+							treeActionError(
+								"bad-request",
+								"label-put requires bounded sessionId and entryId",
+								"label-put",
+								sessionId,
+								entryId,
+							),
+						);
+						return;
+					}
+					// label 缺席 / null / 空白串 = 清除（Pi LabelInput 语义）；非字符串或超长是协议违规。
+					const normalized = normalizeLabelValue(frame.label);
+					if (normalized === null) {
+						send(
+							treeActionError(
+								"bad-request",
+								`label must be a string of at most ${LABEL_MAX_CHARS} chars, null or omitted`,
+								"label-put",
+								sessionId,
+								entryId,
+							),
+						);
+						return;
+					}
+					try {
+						const result = await runtime.putLabel(sessionId, entryId, normalized.label);
+						send({ kind: "label-put", ...result });
+					} catch (error) {
+						if (error instanceof SessionNotFoundError) {
+							send(treeActionError("session-not-found", error.message, "label-put", sessionId, entryId));
+						} else if (error instanceof EntryNotFoundError) {
+							send(treeActionError("entry-not-found", "条目不存在，请刷新会话树", "label-put", sessionId, entryId));
+						} else {
+							log(`internal error handling label-put frame: ${String(error)}`);
+							send(treeActionError("internal", "internal error", "label-put", sessionId, entryId));
+						}
+					}
 					return;
 				}
 
@@ -964,6 +1090,11 @@ export function connectClient(
 					send(errorFrame("unknown-command", `unknown frame type: ${String(frame.type)}`, requestType));
 			}
 		} catch (error) {
+			if (error instanceof HistoryCursorError) {
+				log("history cursor invalid");
+				send(errorFrame("history-cursor-invalid", error.message, requestType, asString(frame, "sessionId")));
+				return;
+			}
 			if (error instanceof HistoryTurnPageTooLargeError) {
 				send(errorFrame("history-turn-too-large", error.message, requestType, asString(frame, "sessionId")));
 				return;

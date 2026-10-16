@@ -1,4 +1,5 @@
-import { historyTurnPage } from "./history-turns.ts";
+import { HistoryCursorError, historyTurnPage } from "./history-turns.ts";
+import { requireAbsoluteDirectory } from "./host-fs.ts";
 import {
 	InputAssistError,
 	type InputContext,
@@ -6,7 +7,7 @@ import {
 	previewInputResources,
 	sessionInputResources,
 } from "./input-assist.ts";
-import type { TreeViewOptions } from "./tree-view.ts";
+import { ENTRY_COPY_MAX_BYTES, entryCopyText, type TreeViewOptions } from "./tree-view.ts";
 // Pi runtime: drives pi agent sessions in-process through the public SDK.
 //
 // This module owns everything session-shaped on the gateway side:
@@ -28,7 +29,7 @@ import type { TreeViewOptions } from "./tree-view.ts";
 //     mid-run ("pi runs on the machine, the phone is just a remote").
 
 import { existsSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	type AgentSessionEvent,
 	createAgentSession,
@@ -86,6 +87,7 @@ export interface PiSessionLike {
 		},
 	): Promise<void>;
 	abort(): Promise<void>;
+	clearQueue(): { steering: string[]; followUp: string[] };
 	setModel(model: unknown, options?: { persist?: boolean }): Promise<void>;
 	setThinkingLevel(level: string): void;
 	setSessionName(name: string): void;
@@ -156,6 +158,11 @@ export interface WireSessionState {
 	thinkingLevel: string;
 	queuedMessages: { steering: string[]; followUp: string[] };
 	contextUsage: { percent: number | null; contextWindow: number; tokens: number | null } | null;
+}
+
+export interface PromptAcceptance {
+	disposition?: "started" | "queued" | "handled";
+	state: WireSessionState;
 }
 
 export interface SessionHandle {
@@ -230,6 +237,7 @@ export type EventSink = (frame: Record<string, unknown>) => void;
  * message_end 的原始消息引用（不快照、不下发），仅供 flush 时按引
  * 用精确匹配新追加条目的 id。 */
 interface PendingFrame {
+	sourceEntryId?: string;
 	finalEvent: Record<string, unknown>;
 	time: number;
 	sourceMessage?: unknown;
@@ -244,9 +252,13 @@ interface LiveHandle {
 	lastActivity: number;
 	unsubscribe: () => void;
 	admissionTail: Promise<void>;
+	/** 包括SDK await abort的启动期；同会话调用完成前不重复触发。 */
+	manualCompaction?: Promise<unknown>;
 	disposed: boolean;
 	/** 统一出站 FIFO：所有 wire 事件先入队，在微任务里批量 flush。 */
 	pendingFrames: PendingFrame[];
+	/** 已观察的公开SessionManager条目位置；custom消息按追加顺序绑定身份。 */
+	customEntryCursor: number;
 	/** 防止同一 tick 重复排 flush。 */
 	flushScheduled: boolean;
 }
@@ -397,6 +409,7 @@ export class PiRuntime {
 	 *  history/tree 的活跃链以此起点构建，否则切分支后网关投影仍从 file 尾
 	 *  取链，对话流不会截断（实测切到中间节点 history 帧仍 44KB 全量）。 */
 	private readonly manualLeafIds = new Map<string, string>();
+	private readonly labelLeafPins = new Map<string, string>();
 	/** In-flight open/create builders, so concurrent requests share one build
 	 * instead of racing into duplicate AgentSessions (pi-web startLocks). */
 	private readonly openingLocks = new Map<string, Promise<SessionHandle>>();
@@ -470,7 +483,7 @@ export class PiRuntime {
 
 	private isHandleRunning(sessionId: string): boolean {
 		const handle = this.handles.get(sessionId);
-		return handle !== undefined && (handle.session.isStreaming || handle.session.isCompacting);
+		return handle !== undefined && (handle.session.isStreaming || this.isHandleCompacting(handle));
 	}
 
 	private async resolveSessionPath(sessionId: string): Promise<string | null> {
@@ -588,6 +601,7 @@ export class PiRuntime {
 			admissionTail: Promise.resolve(),
 			disposed: false,
 			pendingFrames: [],
+			customEntryCursor: sessionManager.getEntries().length,
 			flushScheduled: false,
 		};
 		handle.unsubscribe = session.subscribe((event) => this.onSessionEvent(handle, event));
@@ -602,7 +616,9 @@ export class PiRuntime {
 		let excess = this.handles.size - this.maxLoadedSessions;
 		if (excess <= 0) return;
 		const evictable = [...this.handles.values()]
-			.filter((handle) => handle.subscribers.size === 0 && !handle.session.isStreaming && !handle.session.isCompacting)
+			.filter(
+				(handle) => handle.subscribers.size === 0 && !handle.session.isStreaming && !this.isHandleCompacting(handle),
+			)
 			.sort((a, b) => a.lastActivity - b.lastActivity);
 		for (const victim of evictable) {
 			if (excess <= 0) break;
@@ -640,8 +656,13 @@ export class PiRuntime {
 			const rawMessage = (event as { message?: { role?: string } }).message;
 			const matchableRole =
 				wire.type === "message_end" &&
-				(rawMessage?.role === "user" || rawMessage?.role === "assistant" || rawMessage?.role === "toolResult");
+				(rawMessage?.role === "user" ||
+					rawMessage?.role === "assistant" ||
+					rawMessage?.role === "toolResult" ||
+					rawMessage?.role === "custom");
+			const entry = (event as { entry?: { id?: string } }).entry;
 			handle.pendingFrames.push({
+				sourceEntryId: wire.type === "entry_appended" ? entry?.id : undefined,
 				finalEvent,
 				time: Math.round(this.now()) / 1000,
 				sourceMessage: matchableRole ? rawMessage : undefined,
@@ -668,13 +689,41 @@ export class PiRuntime {
 	 * 逐帧异常隔离：单帧处理失败只丢该帧的 entryId/下发，不影响后续
 	 * 队列；dispose 会置 disposed 并清队列，旧句柄残留的 flush 不会发帧。 */
 	private flushPendingFrames(handle: LiveHandle): void {
+		// SDK 1.0.4的custom消息独立落为custom_message，不保留原message引用。
+		// 只关联同批追加、顺序一致且数量相等的公开条目；从不按正文/时间猜身份。
+		const customIds = new Map<PendingFrame, string>();
+		const messages = handle.pendingFrames.filter(
+			(item) => isRecord(item.sourceMessage) && item.sourceMessage.role === "custom",
+		);
+		const customEntryAppended = handle.pendingFrames.some(
+			(item) =>
+				item.finalEvent.type === "entry_appended" &&
+				isRecord(item.finalEvent.entry) &&
+				item.finalEvent.entry.type === "custom_message",
+		);
+		// 文本token/普通工具批次不读取整份SessionManager条目，避免大会话逐token扫描。
+		if (messages.length > 0 || customEntryAppended)
+			try {
+				const entries = handle.sessionManager.getEntries();
+				const explicitIds = new Set(handle.pendingFrames.map((item) => item.sourceEntryId));
+				const appended = entries
+					.slice(handle.customEntryCursor)
+					.filter((entry) => entry.type === "custom_message" && !explicitIds.has(entry.id));
+				handle.customEntryCursor = entries.length;
+				if (messages.length === appended.length)
+					messages.forEach((item, index) => {
+						customIds.set(item, appended[index].id);
+					});
+			} catch {
+				// 条目不可读时仍转发消息，保守省略身份。
+			}
 		while (!handle.disposed && handle.pendingFrames.length > 0) {
 			const item = handle.pendingFrames.shift() as PendingFrame;
 			try {
 				// 身份补全：按原 message 引用精确匹配 pi 刚 append 的条目。
 				// 匹配不到/条目读取失败时仅省略 entryId，帧本体照发不丢。
-				let entryId: string | undefined;
-				if (item.sourceMessage !== undefined) {
+				let entryId = item.sourceEntryId ?? customIds.get(item);
+				if (entryId === undefined && item.sourceMessage !== undefined) {
 					try {
 						entryId = this.matchAppendedEntry(handle, item.sourceMessage);
 					} catch (error) {
@@ -828,7 +877,8 @@ export class PiRuntime {
 		text: string,
 		mode: "prompt" | "steer" | "followUp",
 		images: ImageAttachment[] = [],
-	): Promise<void> {
+		onAccepted?: (acceptance: PromptAcceptance) => void,
+	): Promise<PromptAcceptance> {
 		const live = this.handles.get(handle.session.sessionId);
 		if (!live || live.disposed) throw new Error("session handle is no longer loaded");
 
@@ -843,7 +893,7 @@ export class PiRuntime {
 		await previous;
 		try {
 			live.lastActivity = this.now();
-			await new Promise<void>((resolve, reject) => {
+			const disposition = await new Promise<"started" | "queued" | "handled" | undefined>((resolve, reject) => {
 				let settled = false;
 				const finish = (settle: () => void) => {
 					if (settled) return;
@@ -878,7 +928,7 @@ export class PiRuntime {
 						preflightResult: (disposition) => {
 							// Pi 1.0：开始、排队、被扩展处理都已受理；拒绝走throw。
 							if (disposition === "started" || disposition === "queued" || disposition === "handled") {
-								finish(resolve);
+								finish(() => resolve(disposition));
 							}
 						},
 					});
@@ -887,7 +937,7 @@ export class PiRuntime {
 					return;
 				}
 				run.then(
-					() => finish(resolve),
+					() => finish(() => resolve(undefined)),
 					(error) => finish(() => reject(error)),
 				);
 			});
@@ -895,18 +945,69 @@ export class PiRuntime {
 			// 手动叶子表达的“正在浏览旧分支”已被本次提交消费。不释放会让
 			// 后续 history（切会话再切回、翻页）一直锚在分叉前的旧窗口，
 			// 新消息直到 resetLeaf 重连补拉才可见。
-			this.manualLeafIds.delete(handle.session.sessionId);
+			if (disposition !== "handled") {
+				this.manualLeafIds.delete(handle.session.sessionId);
+				this.labelLeafPins.delete(handle.session.sessionId);
+			}
+			// 先发已排定的旧事件，再同步发快照ACK；否则await Router的间隙会让
+			// 旧settled先于ACK到达，陈旧的streaming快照又把手机恢复成Working。
+			this.flushPendingFrames(live);
+			const acceptance = { disposition, state: this.liveState(handle.session.sessionId, live) };
+			onAccepted?.(acceptance);
+			return acceptance;
 		} finally {
 			release();
 		}
 	}
 
-	/** Abort the current run and wait for the session to go idle. */
-	async abort(sessionId: string): Promise<void> {
-		const handle = this.handles.get(sessionId);
-		if (!handle) return;
-		handle.lastActivity = this.now();
-		await handle.session.abort();
+	/** Pi TUI 的队列取回：只清尚未消费的队列，绝不中断当前 run。 */
+	async dequeue(
+		sessionId: string,
+		onDequeued?: (queued: string[], state: WireSessionState) => void,
+	): Promise<{ queued: string[]; state: WireSessionState }> {
+		const live = this.handles.get(sessionId);
+		if (!live) {
+			const state = this.stateFrom(sessionId, []);
+			onDequeued?.([], state);
+			return { queued: [], state };
+		}
+		const previous = live.admissionTail;
+		let release!: () => void;
+		live.admissionTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			live.lastActivity = this.now();
+			const removed = live.session.clearQueue();
+			const queued = [...removed.steering, ...removed.followUp];
+			const state = this.liveState(sessionId, live);
+			// 在同一同步段发回执，后续agent_settled不能先于这份快照到客户端。
+			onDequeued?.(queued, state);
+			return { queued, state };
+		} finally {
+			release();
+		}
+	}
+
+	/** CLI Esc clears queued text before aborting; opt-in preserves legacy clients. */
+	async abort(sessionId: string, restoreQueued = false): Promise<{ queued: string[]; state: WireSessionState }> {
+		const live = this.handles.get(sessionId);
+		if (!live) return { queued: [], state: this.stateFrom(sessionId, []) };
+		const previous = live.admissionTail;
+		let release!: () => void;
+		live.admissionTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			live.lastActivity = this.now();
+			const removed = restoreQueued ? live.session.clearQueue() : { steering: [], followUp: [] };
+			await live.session.abort();
+			return { queued: [...removed.steering, ...removed.followUp], state: this.liveState(sessionId, live) };
+		} finally {
+			release();
+		}
 	}
 
 	// -- model catalog / switching ---------------------------------------------
@@ -1379,7 +1480,7 @@ export class PiRuntime {
 	 */
 	async restartSession(sessionId: string): Promise<WireSessionState> {
 		const existing = this.handles.get(sessionId);
-		if (existing && !existing.disposed && (existing.session.isStreaming || existing.session.isCompacting)) {
+		if (existing && !existing.disposed && (existing.session.isStreaming || this.isHandleCompacting(existing))) {
 			throw new SessionRestartError(sessionId);
 		}
 		const carriedSubscribers = existing ? [...existing.subscribers] : [];
@@ -1389,6 +1490,7 @@ export class PiRuntime {
 		}
 		// 配置语义对齐 pi 重开：手动叶子属于旧运行时视图，一并释放。
 		this.manualLeafIds.delete(sessionId);
+		this.labelLeafPins.delete(sessionId);
 		await this.openSession(sessionId);
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
@@ -1396,19 +1498,37 @@ export class PiRuntime {
 		return this.liveState(sessionId, live);
 	}
 
-	/** 手动压缩（pi 原生 /compact 语义）：compact() 会先中止当前运行，随后开始
-	 *  压缩流程；compaction_start/compaction_end 事件本来就经事件流透传给订阅
-	 *  客户端，本帧只回触发时的状态快照（isCompacting 由 pi 翻转）。 */
+	/** 压缩调用从等待abort开始即占用；结束后推送最终状态，断线重连也可查询。 */
 	async beginCompact(sessionId: string): Promise<WireSessionState> {
 		const handle = await this.openSession(sessionId);
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		live.lastActivity = this.now();
-		void handle.session.compact().catch((error) => {
-			// 启动失败（如未选模型）无法直接回帧（本帧已应答）：进日志，
-			// 客户端可从 state 轮询看到 isCompacting 未翻转。
-			this.log(`compact of ${sessionId} failed: ${String(error)}`);
-		});
+		if (!live.manualCompaction) {
+			const pending: Promise<unknown> = Promise.resolve()
+				.then(() => handle.session.compact())
+				.catch((error) => this.log(`compact of ${sessionId} failed: ${String(error)}`))
+				.finally(() => {
+					if (live.manualCompaction !== pending) return;
+					live.manualCompaction = undefined;
+					if (live.disposed || this.handles.get(sessionId) !== live) return;
+					try {
+						// 已排队的Pi结束事件必须先于最终快照，避免旧活动状态复活。
+						this.flushPendingFrames(live);
+						const frame = { kind: "compact-finished", ...this.liveState(sessionId, live) };
+						for (const sink of live.subscribers) {
+							try {
+								sink(frame);
+							} catch {
+								/* 失效连接不影响其他订阅者。 */
+							}
+						}
+					} catch (error) {
+						this.log(`compact state of ${sessionId} failed: ${String(error)}`);
+					}
+				});
+			live.manualCompaction = pending;
+		}
 		return this.liveState(sessionId, live);
 	}
 
@@ -1490,13 +1610,43 @@ export class PiRuntime {
 
 	/** 内部钉子有效性：id 须在文件全部 entries 中，否则自愈丢弃回文件尾（history/tree 共用）。 */
 	private dropStaleManualLeaf(sessionId: string, entries: SessionEntry[]): string | undefined {
+		const live = this.handles.get(sessionId);
+		if (live && !live.disposed) this.followLiveManualLeaf(live, entries);
 		const manualLeafId = this.manualLeafIds.get(sessionId);
 		if (manualLeafId !== undefined && !entries.some((entry) => entry.id === manualLeafId)) {
+			// SDK首条会话消息前可能尚未落盘：只暂用文件视图，不丢有效live标签钉子。
+			if (
+				live &&
+				!live.disposed &&
+				this.labelLeafPins.get(sessionId) === manualLeafId &&
+				live.sessionManager.getEntry(manualLeafId)
+			)
+				return undefined;
 			this.manualLeafIds.delete(sessionId);
+			this.labelLeafPins.delete(sessionId);
 			this.log(`stale manual leaf dropped for ${sessionId}`);
 			return undefined;
 		}
 		return manualLeafId;
+	}
+
+	/** 标签写之后，SDK仍可能自然追加消息或压缩条目。只跟随标签钉子
+	 * 的运行时后代，不把文件里其他分支的尾部当当前分支；回收前也同步一次。 */
+	private followLiveManualLeaf(handle: LiveHandle, availableEntries?: SessionEntry[]): void {
+		const sessionId = handle.session.sessionId;
+		const pinned = this.manualLeafIds.get(sessionId);
+		if (pinned === undefined || this.labelLeafPins.get(sessionId) !== pinned) return;
+		const current = this.currentLeafId(handle);
+		if (current === null || current === pinned) return;
+		if (availableEntries && !availableEntries.some((entry) => entry.id === current)) return;
+		try {
+			if (handle.sessionManager.getBranch(current).some((entry) => entry.id === pinned)) {
+				this.manualLeafIds.set(sessionId, current);
+				this.labelLeafPins.set(sessionId, current);
+			}
+		} catch (error) {
+			this.log(`manual leaf refresh failed for ${sessionId}: ${String(error)}`);
+		}
 	}
 
 	/** 当前叶子：pi 原生从 sessionManager 取（TUI 的 realLeafId 语义）。 */
@@ -1532,7 +1682,7 @@ export class PiRuntime {
 	}> {
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
-		if (live.session.isCompacting) {
+		if (this.isHandleCompacting(live)) {
 			throw new SessionNameError("压缩进行中，请等压缩完成后再切换分支");
 		}
 
@@ -1571,6 +1721,7 @@ export class PiRuntime {
 		}
 		const newLeafId = this.currentLeafId(live);
 		if (newLeafId !== null) this.manualLeafIds.set(sessionId, newLeafId);
+		this.labelLeafPins.delete(sessionId);
 		return {
 			entryId,
 			leafId: newLeafId,
@@ -1579,6 +1730,88 @@ export class PiRuntime {
 			queued,
 			state: this.liveState(sessionId, live),
 		};
+	}
+
+	/**
+	 * 整条 entry 的可复制全文（Pi TUI 的 Ctrl+X / `app.message.copy`，PROTOCOL §4.26）。
+	 * 文本口径由 `entryCopyText` 对齐 tree-selector 的 getEntryCopyText：不是 120 字
+	 * 预览，也不是整条分支。只读，所以与 attachment 同一查找路径：live 句柄优先，
+	 * 未加载时回落到文件视图（文件头 id 是权威身份，避免陈旧索引读到别的会话）。
+	 * 超过 ENTRY_COPY_MAX_BYTES 时**不回文本**，只回 oversized+bytes：截断后仍声称
+	 * “全文”会让用户把半截内容粘走。
+	 */
+	async entryCopy(
+		sessionId: string,
+		entryId: string,
+	): Promise<{ sessionId: string; entryId: string; bytes: number; text?: string; oversized?: boolean }> {
+		const entry = await this.lookupEntry(sessionId, entryId);
+		const text = entryCopyText(entry);
+		if (text === undefined) throw new EntryCopyEmptyError(entryId);
+		const bytes = Buffer.byteLength(text, "utf8");
+		if (bytes > ENTRY_COPY_MAX_BYTES) return { sessionId, entryId, bytes, oversized: true };
+		return { sessionId, entryId, bytes, text };
+	}
+
+	/**
+	 * 写标签（Pi TUI 的 Shift+L → `sessionManager.appendLabelChange`，PROTOCOL §4.27）。
+	 * label 为 undefined 即清除。追加的 LabelEntry 以**当前运行时叶子**为父并推进叶子
+	 * （Pi 同一行为，条目本身不参与模型上下文），因此：
+	 * - 必须在 live 句柄上写：另开一个文件视图 SessionManager 追加会与运行时叶子分叉；
+	 * - 写完同步 manualLeafIds 钉子，否则 tree/history 仍按旧叶子投影，
+	 *   “显示的当前行”与“跳转目标”会错位；
+	 * - targetId 指向被选中的 entry（不是新 LabelEntry），旧消息不改写，同一 target
+	 *   多次追加时最后一条记录生效（Pi labelsById 覆盖语义）。
+	 */
+	async putLabel(
+		sessionId: string,
+		entryId: string,
+		label: string | undefined,
+	): Promise<{
+		sessionId: string;
+		entryId: string;
+		label: string | null;
+		labelEntryId: string;
+		leafId: string | null;
+	}> {
+		const live = this.handles.get(sessionId);
+		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
+		if (!live.sessionManager.getEntry(entryId)) throw new EntryNotFoundError(entryId);
+		// 目标已同步核对；落盘异常应由 router 按 internal 收尾，不能伪报条目不存在。
+		const labelEntryId = live.sessionManager.appendLabelChange(entryId, label);
+		const leafId = this.currentLeafId(live);
+		if (leafId !== null) {
+			this.manualLeafIds.set(sessionId, leafId);
+			this.labelLeafPins.set(sessionId, leafId);
+		}
+		live.lastActivity = this.now();
+		return { sessionId, entryId, label: label ?? null, labelEntryId, leafId };
+	}
+
+	/** entry 查找（entry-copy 用）：live 优先，失败或未加载时回落文件视图。 */
+	private async lookupEntry(sessionId: string, entryId: string): Promise<SessionEntry> {
+		let entry: SessionEntry | undefined;
+		const live = this.handles.get(sessionId);
+		if (live && !live.disposed) {
+			try {
+				entry = live.sessionManager.getEntry(entryId);
+			} catch (error) {
+				this.log(`entry-copy live lookup failed for ${sessionId}: ${String(error)}`);
+			}
+		}
+		if (!entry) {
+			const path = await this.resolveSessionPath(sessionId);
+			if (path === null) {
+				if (live && !live.disposed) throw new EntryNotFoundError(entryId);
+				throw new SessionNotFoundError(sessionId);
+			}
+			if (live && !live.disposed && !existsSync(path)) throw new EntryNotFoundError(entryId);
+			const manager = this.openSessionManager(path);
+			if (manager.getSessionId() !== sessionId) throw new SessionNotFoundError(sessionId);
+			entry = manager.getEntry(entryId);
+			if (live && !live.disposed) live.lastActivity = this.now();
+		}
+		if (!entry) throw new EntryNotFoundError(entryId);
+		return entry;
 	}
 
 	// -- history / state --------------------------------------------------------
@@ -1691,7 +1924,7 @@ export class PiRuntime {
 		let sliced = turnPage
 			? { entries: [] as SessionEntry[], hasMore: false }
 			: sliceActiveBranchTail(entries, effectiveLimit, cursor, startLeafId);
-		if ("error" in sliced) throw new Error(`unknown beforeEntryId: ${beforeEntryId}`);
+		if ("error" in sliced) throw new HistoryCursorError();
 		let messages: WireMessage[] = [];
 		let entryIds: string[] = [];
 		for (;;) {
@@ -1794,13 +2027,17 @@ export class PiRuntime {
 		};
 	}
 
+	private isHandleCompacting(handle: LiveHandle): boolean {
+		return handle.session.isCompacting || handle.manualCompaction !== undefined;
+	}
+
 	private liveState(sessionId: string, live: LiveHandle): WireSessionState {
 		const model = live.session.model;
 		const usage = live.session.getContextUsage();
 		return {
 			sessionId,
 			isStreaming: live.session.isStreaming,
-			isCompacting: live.session.isCompacting,
+			isCompacting: this.isHandleCompacting(live),
 			model: model ? { provider: model.provider, modelId: model.id } : null,
 			thinkingLevel: live.session.thinkingLevel,
 			queuedMessages: {
@@ -1901,6 +2138,7 @@ export class PiRuntime {
 
 	private disposeHandle(handle: LiveHandle): void {
 		if (handle.disposed) return;
+		this.followLiveManualLeaf(handle);
 		handle.disposed = true;
 		handle.unsubscribe();
 		// 清空出站队列：微任务里的残留 flush 对已处置的句柄不得再发帧。
@@ -1917,7 +2155,7 @@ export class PiRuntime {
 	sweep(): void {
 		for (const handle of this.handles.values()) {
 			if (handle.subscribers.size > 0) continue;
-			if (handle.session.isStreaming || handle.session.isCompacting) continue;
+			if (handle.session.isStreaming || this.isHandleCompacting(handle)) continue;
 			if (this.now() - handle.lastActivity < this.idleDisposeMs) continue;
 			this.log(`disposing idle session ${handle.session.sessionId}`);
 			this.disposeHandle(handle);
@@ -1959,6 +2197,22 @@ export class AttachmentNotFoundError extends Error {
 }
 /** 单图原始字节超过 4 MiB（不发巨大帧）。 */
 export class AttachmentTooLargeError extends Error {}
+
+/** tree 动作（§4.26/§4.27）的目标 entry 不在该会话里：陈旧树快照、外部改写或伪造 id。 */
+export class EntryNotFoundError extends Error {
+	constructor(entryId: string) {
+		super(`entry not found: ${entryId}`);
+		this.name = "EntryNotFoundError";
+	}
+}
+
+/** 该 entry 没有可复制文本（Pi："Selected entry has no text to copy"）——不造占位文本。 */
+export class EntryCopyEmptyError extends Error {
+	constructor(entryId: string) {
+		super(`entry has no copyable text: ${entryId}`);
+		this.name = "EntryCopyEmptyError";
+	}
+}
 /** mime 非法或 base64 解码失败（消息可回显客户端）。 */
 export class AttachmentInvalidError extends Error {
 	constructor(message: string) {
@@ -2018,16 +2272,7 @@ function wireInput(raw: unknown): string[] {
 
 /** Validate a client-provided cwd for new sessions. */
 export function validateCwd(cwd: string): string {
-	if (!isAbsolute(cwd)) throw new Error("cwd must be an absolute path");
-	const resolved = resolve(cwd);
-	let stats: ReturnType<typeof statSync>;
-	try {
-		stats = statSync(resolved);
-	} catch {
-		throw new Error(`cwd does not exist: ${resolved}`);
-	}
-	if (!stats.isDirectory()) throw new Error(`cwd is not a directory: ${resolved}`);
-	return resolved;
+	return requireAbsoluteDirectory(cwd);
 }
 
 export interface ScopedEntryLike {

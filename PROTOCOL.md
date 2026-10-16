@@ -30,6 +30,8 @@
 
 `code`：`bad-request` / `unknown-command` / `session-not-found` / `prompt-rejected` / `internal` / `session-restart-busy` / `attachment-not-found` / `attachment-too-large` / `attachment-invalid`。
 
+补充安全错误分类：`directory-permission-denied` / `directory-not-found` / `directory-not-directory` / `directory-name-invalid` / `directory-name-conflict` / `filesystem-read-only` / `storage-full` / `history-cursor-invalid` / `provider-not-found` / `provider-config-read-failed` / `provider-config-write-failed`。文案为固定短句，不含原始OS异常、目标路径、游标或凭据；未知故障仍用`internal`，客户端不能据此推断权限。旧客户端仍可按通用请求拒绝处理，旧网关的`bad-request/internal`不能被新客户端猜成细分类别。
+
 ---
 
 ## 1.5 能力通告（hello.capabilities）
@@ -48,6 +50,7 @@
 | `["…","commands"]` | 自定义命令清单（三源：扩展/模板/skill；执行复用 `message` 原文透传） |
 | `["…","input-resources","input-completions"]` | Skills/Prompt 候选与宿主 @ 路径补全；按查询 ID 关联并取消旧搜索 |
 | `["…","tree","switch-branch"]` | 会话分支树与分支切换 |
+| `["…","entry-copy","label-put"]` | 树动作：整条 entry 可复制全文（Pi Ctrl+X）/ 标签写（Pi Shift+L）；同时宣告特性名 `tree-actions-v1` |
 | `["…","attachment"]` | 历史图片按需取回（按 `sessionId+entryId+imageIndex`，单图 4 MiB） |
 
 上表按阶段累积描述，**数组顺序不属于契约**：客户端只做成员检测（`kind in capabilities`）。
@@ -154,7 +157,9 @@
 ```json
 {"type":"message","sessionId":"<已有会话>","text":"…","mode":"prompt|steer|followUp"}
 {"type":"message","cwd":"/绝对路径","text":"…"}            // 新建会话
-→ {"kind":"sent","sessionId":"<uuid>","mode":"prompt"}
+→ {"kind":"sent","sessionId":"<uuid>","mode":"prompt",
+   "disposition":"started|queued|handled","isStreaming":true,"isCompacting":false,
+   "queuedMessages":{"steering":[],"followUp":[]}}
 ```
 
 - `sessionId` 与 `cwd` **二选一**：`sessionId` 续已有会话；`cwd`（绝对路径、必须存在的目录）新建会话；
@@ -162,6 +167,7 @@
 - **纯图消息会被网关注入单个空格占位**：pi 的 `prompt(text, {images})` 会**无条件**生成 `{type:"text", text}` 块（`agent-session.js`），空 text 会被 OpenAI 兼容上游拒（实测报 `400 messages 参数非法`）。因此网关在「text 全空白 + 携带图片」时改传 `" "`。可见后果：该消息在 pi 会话、`event` 帧与 `history` 回放中的 `text` 是 `" "` 而非 `""`，客户端应按**空白**（`isBlank`）而非 `isNotEmpty` 判定“无正文”。另有回退：会话列表的 `firstMessage` 对空白值回退为 `(no messages)`；
 - `mode`（可选，默认 `"prompt"`）：`steer`/`followUp` 在会话正在流式时排队（pi 的 `streamingBehavior`）；不带 `mode` 且会话正在流式 → 错误帧（pi 语义，不猜默认）；
 - 应答在**受理时**返回（pi preflight 通过即回 `sent`），不等运行结束——之后的一切通过 `event` 帧流式推送；受理后的失败（重试耗尽、provider 报错）也走事件流，不补发 error 帧；
+- `prompt-disposition-v1` 能力表示 `sent` 携带 SDK 的 `disposition` 和受理后的会话快照。`started` 为普通运行、`queued` 为忙时排队、`handled` 为该次输入已被处理器消费；后者不表示整个会话空闲，也不能生成假的 `agent_settled`。客户端分开维护待回执输入与实际运行，按快照及后续事件收尾。旧网关缺少能力时保留旧行为；旧客户端可忽略新增字段。
 - 同步校验/预检失败（无模型、流式中无 mode、扩展命令被拒等）→ `prompt-rejected` 错误帧；
 - 发送方连接**自动订阅**该会话的事件流（先订阅后 prompt，不漏首帧）；
 - **`images`（可选）：图片附件**，pi `ImageContent` 直传：`[{"type":"image","data":"<base64>","mimeType":"image/jpeg"}, …]`；校验：数组 ≤ 4 项（与 18 MiB 帧上限的 4 张预算对齐）、每项 `type` 必须为 `image`、`data` 非空、`mimeType` 必须 `image/*`，否则 `bad-request`；空数组等同不带；帧内多余字段一律丢弃，不进入 pi 请求。附件随消息进入 pi 会话记录，后续 history 亦还原它们；
@@ -222,6 +228,10 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 - **缺失语义**：匹配失败（pi 尚未/不再 append、`custom` 类型消息走独立的持久化入口、`getEntries` 读取异常等）时 `entryId` 整个缺席，帧本体照发不丢；客户端必须把缺席当“身份未知”处理，**禁止**在无 `entryId` 时用 `role`+内容或 toolCallId 把实时帧与历史条目配对——同一回合内可能出现多条同文消息（重试、中间快照、用户二次粘贴），指纹对不上就是删错条目；
 - **一条消息多个事件**：同一条目可能先后发出多个实时事件。客户端如需把身份归并到“同一消息”，应以 **`sessionId` + `entryId` + 归一化 `type`/`toolCallId`** 为键；无 `entryId` 的事件不参与身份归并。
 
+嵌套工具沿用公开执行事件的 `parentToolCallId`；`tool_execution_update` 也保留该字段。嵌套结果可能只有 `tool_execution_end`、没有独立持久化的 `toolResult` 消息，客户端必须据调用ID收尾；普通顶层工具仍以 `toolResult` 消息作为最终持久化结果，不重复显示两次。
+
+可见 `message_end(role=custom)` 与 `entry_appended(type=custom_message)` 使用通用文本消息，不运行插件renderer；仅 `display=true` 显示，`custom` 内部记录不显示。网关在同一SDK追加批次内按事件/条目顺序绑定custom消息的 `entryId`，只在一一对应可证明时绑定；数量不符时省略身份，不按正文、时间或customType猜测。
+
 ### 4.6 `history` — 历史分页（条目游标）
 
 ```json
@@ -236,8 +246,8 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 ```
 
 - 内容 = 会话**活动分支**（从当前叶子向根回溯）的最新一页：通常来自当前会话文件，页内条目全部上送（compaction 条目渲染为标记行，不做模型上下文裁剪）；两个可证明的未落盘窗口由活动句柄的 live `SessionManager` 补入尚未落盘的条目，**两窗口共用同一前缀防护——文件视图必须是 live 条目的前缀（文件不存在/为空时平凡成立），前缀不成立（文件被外部重写/重排）时 live 视为陈旧不并入，避免已删除条目复活**：① Pi 首个 assistant 出现前会延迟创建/刷新新会话文件（不要求流式中）；② 旧会话 run 进行中（`isStreaming` 作为 in-flight 证据）——pi 先 emit 事件后 `appendMessage` 落盘，手机强退重开的 history 若只读文件会把刚发出的 user 判成不存在。外部删除文件尾部的复活风险与 pi 自身在该病态场景的数据不一致同源，属可接受残余；
-- **游标分页**：`beforeEntryId` 互斥（不含该条）；首页不传。`hasMore` + `oldestEntryId` 指向更旧一页；游标不存在或不在活动分支上（含已放弃分支）→ `internal` 错误（客户端应重取首页）；
-- **`limit` 是“原始 entries 预算”，不是消息条数**：活跃链上存在不渲染为消息的元数据条目（`model_change`、`thinking_level_change`、空 `summary` 的 `branch_summary`、非 `empty-stop-retry` 的 `custom` 等），它们消耗预算但不进 `messages`，因此 `messages.length` 可以小于 `limit`。**仅当整页预算全被这类条目占满、转换后一条消息都没有时**，网关会沿该页最旧条目继续向前切（游标每轮严格变旧），直到出现可展示消息或走到真正的链头——避免旧行为返回“空页 + `hasMore:false`”把更早的消息永久挡住。**有可展示消息的页不会被跳过**，逐页仍按 `limit` 条原始 entries 前进。请求字段与响应结构均不变，无新增字段；
+- **游标分页**：`beforeEntryId` 互斥（不含该条）；首页不传。`hasMore` + `oldestEntryId` 指向更旧一页；游标不存在或不在活动分支上（含已放弃分支）→ `history-cursor-invalid` 错误（客户端应重取首页）；
+- **`limit` 是“原始 entries 预算”，不是消息条数**：活跃链上存在不渲染为消息的元数据条目（`model_change`、`thinking_level_change`、空 `summary` 的 `branch_summary`、`custom` 内部数据 等），它们消耗预算但不进 `messages`，因此 `messages.length` 可以小于 `limit`。**仅当整页预算全被这类条目占满、转换后一条消息都没有时**，网关会沿该页最旧条目继续向前切（游标每轮严格变旧），直到出现可展示消息或走到真正的链头——避免旧行为返回“空页 + `hasMore:false`”把更早的消息永久挡住。**有可展示消息的页不会被跳过**，逐页仍按 `limit` 条原始 entries 前进。请求字段与响应结构均不变，无新增字段；
   - 边界：`display:false` 的 `custom_message` 在网关侧仍算“有消息”（原样上送，由客户端跳过渲染），这类页不触发向前补切；
 - `messages` 与 `entryIds` 平行对齐（`entryIds[i]` 是 `messages[i]` 背后的条目 id，fork/定位用）；
 - **`resetLeaf:true`（仅全新加载，翻页绝不能带）**：重连 catch-up 用（pi TUI"重开会话回文件尾"语义）——释放该会话的手动叶子（树页点节点切分支的钉子）并把活跃链锚回文件尾；有活动句柄时尽力把运行时叶子同步回文件尾（流式中可能被 pi 拒绝，不阻塞应答）；
@@ -246,8 +256,8 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 - **单条消息上限 512 KiB**：超限消息先降损（图片 base64 → 元数据占位 `dataOmitted`/`dataBytes`，超长文本截断加 `[已截断]` 尾标），仍超限则整条替换为 `{role:"custom","customType":"wire-oversized",content:"[消息过大，移动端已省略]"}`——因此 2 MiB 页上限恒成立；被剥图的完整内容随后用 `attachment` 帧按需取回（§4.22）；
 - 消息里 assistant 的工具调用块已从文件格式（`{id,name,arguments}`）归一为运行时格式（`{toolCallId,toolName,input}`），与实时 `message_end` 一致；
 - **`timestamp`（epoch 毫秒）**：`message` 条目由 pi 自带、网关原样透传；`compaction`/`branch_summary`/`custom_message`/`custom` 由条目 ISO 时间换算。客户端必须把缺省当成“时间未知”（不得参与耗时差值），否则历史项与实时事件混在同一组时会算出 `now - 0` 这种荒谬耗时；
-- **`role:"custom"` 条目**：`empty-stop-retry`（上游空回复重试）会还原成 `{"role":"custom","customType":"empty-stop-retry","details":{attempt,reason,model}}`——`reason` 是真实上游错误文本，客户端历史重建时应与实时侧一致地渲染成可见的上游错误提示（仅 `attempt==1` 渲染，重试次不重复）。该 customType **由 `empty-stop-guard` 一类扩展写入，不是 pi 原生**；未安装此类扩展时条目不存在，客户端行为与 pi 原生一致（无提示）。其他 `custom` 事件条目不是消息，不进 history；
-- **`custom_message` 条目**（role=custom + `content`/`display`）：**始终进入模型上下文**（这是扩展注入隐藏续跑指令的机制），`display` **只控制 UI 渲染**——`display=false` 表示**完全隐藏**（pi TUI 同样不渲染），客户端必须跳过、不得渲染；`display` 缺省或 true 时按普通自定义消息处理；
+- **历史来源 `entryType`**：Pi `compaction`、可见/隐藏的 `custom_message`、网关超限占位分别标为 `compaction` / `custom_message` / `wire_oversized`。客户端据来源区分消息，不能用扩展自选的 `customType` 判断原生压缩或上游错误；无来源字段的旧消息只可按可见文本保守显示。Pi `custom` 是内部数据，一律不转 history 消息，包括旧 `empty-stop-retry` 特例。
+- **`custom_message` 条目**（role=custom + `content`/`display`）：**始终进入模型上下文**（这是扩展注入隐藏续跑指令的机制），`display` **只控制 UI 渲染**——`display=false` 表示**完全隐藏**（pi TUI 同样不渲染），客户端必须跳过、不得渲染；仅 `display=true` 时按普通自定义消息处理；缺省与 false 均隐藏（对齐 Pi TUI）；
 - `model`/`thinkingLevel`：有活动句柄取实时值，否则从文件条目回溯推导；`isStreaming` 只有句柄在内存时才可能为 true；
 - `queuedMessages`/`contextUsage`：文件回溯时为空/null。
 
@@ -261,13 +271,31 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 
 用于断线重连/页面切回时的对账（pi-web 同款 reconcile 思路）：客户端轮询 state，发现 `isStreaming` 则重订阅 + 重取 history 尾部。
 
+### 4.8a `dequeue` — 取回未执行队列，保持当前运行
+
+```json
+{"type":"dequeue","sessionId":"<uuid>","queueRequestId":"<本次唯一ID>"}
+→ {"kind":"dequeued","sessionId":"<uuid>","queueRequestId":"<同一ID>","queued":["steer text","follow-up text"],"isStreaming":true,"isCompacting":false,"queuedMessages":{"steering":[],"followUp":[]}}
+```
+
+仅在 hello.capabilities 包含 `dequeue` 时使用。`sessionId` 与非空、最长128字符的 `queueRequestId` 必填；校验失败不清队列，错误应答回显有效的关联ID。网关在同会话prompt admission串行区调用公开SDK `clearQueue()`，整批取回当时尚未消费的steering→followUp文本，不调用abort、不重新入队、不停止当前回答或工具。已被Pi消费的消息不在取回载荷中；无活动句柄或队列已空返回空数组，不加载/创建会话。
+
+`queued` 是本次取回文本，`queuedMessages` 是取回后的真实状态；客户端仅凭同会话、同queueRequestId的回执合并到当前草稿前，以双换行分隔并保留新附件，不自动发送。取消的队列不再各自settled，客户端扣除对应待运行计数，但流式/压缩中的当前运行必须继续保活。SDK仅支持整批文本取回，未提供逐项/排队图片恢复；取回后断线丢回执也不保证跨连接恢复。手机不得通过清空再重排实现伪逐项撤回。
+
 ### 4.8 `abort` — 中止当前运行
 
 ```json
-{"type":"abort","sessionId":"<uuid>"} → {"kind":"aborted","sessionId":"…"}
+{"type":"abort","sessionId":"<uuid>","restoreQueued":true}
+→ {"kind":"aborted","sessionId":"…","isStreaming":false,"isCompacting":false,
+   "model":{…}|null,"thinkingLevel":"…","contextUsage":{…}|null,
+   "queuedMessages":{"steering":[],"followUp":[]},"queued":["取回的文本"]}
 ```
 
-等待会话真正空闲后应答。会话未加载（必不在运行）也返回 `aborted`。
+等待会话真正空闲后应答，并附当前 state 形状。会话未加载（必不在运行）也返回空闲快照。
+
+`restoreQueued:true` 对齐 Pi TUI Esc：在同会话 prompt admission 串行区内，先用公开 SDK `clearQueue()` 取走尚未消费的 steering/followUp 文本，再中止运行；`queued` 按 steering→followUp 顺序返回，客户端以双换行合并到当前草稿之前，不自动重发。`queuedMessages` 是清理后的当前队列，不能和取回载荷 `queued` 混用。`queue_update` 仍是原生事件，不伪造 Agent 终态；空闲残留队列也可取回。SDK 1.0.4 的取回 API 仅返回文本，不承诺排队图片恢复。断线丢失回执时不能保证取回内容跨连接恢复。
+
+省略/false 保留旧版只停止语义，不清队列，也不返回 `queued`，避免旧客户端无法接收文本而丢稿。旧网关忽略该请求扩展时只回旧 `aborted`，新客户端不得凭本地队列快照假装已撤销。
 
 - 对未加载会话的 `message`/`subscribe` 会触发按需加载（含扩展绑定，毫秒级～秒级）。
 
@@ -281,7 +309,7 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 - `entries` 只含**子目录**（文件夹选择器语义）：`{name, path, hidden}`，`hidden` 标记点开头目录；
 - `crumbs` 为从根到当前目录的面包屑链（含当前目录），客户端以倒数第二个元素作为上级目录；
 - 条目按名称排序，超过 500 条截断并置 `truncated: true`；
-- `path` 必须是绝对路径，不存在/不是目录回 `bad-request`。
+- `path` 必须是绝对路径，不存在/不是目录分别回 `directory-not-found` / `directory-not-directory`；无权限回 `directory-permission-denied`，其他分类见统一错误码。
 
 ### 4.10 `directory-create` — 新建文件夹
 
@@ -290,7 +318,7 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 → {"kind":"directory-create","path":"/父目录/新文件夹","created":true}
 ```
 
-父目录必须存在且为目录；`name` 不得为空/`.`/`..`/含分隔符。已存在同名目录返回 `created:false`。
+父目录必须存在且为目录；`name` 不得为空/`.`/`..`/含分隔符。已存在同名目录返回 `created:false`。名称不合法回`directory-name-invalid`，同名非目录回`directory-name-conflict`；权限/只读/空间不足分别按统一错误码返回。
 
 ### 4.11 `workspace-create` — 创建工作区（新会话的 cwd）
 
@@ -365,11 +393,19 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 
 - 对齐 pi 原生 `/compact`：`session.compact()` 会**先中止当前运行**再开始压缩流程（当前
   对话中未完成的回答会被中断）；`compaction_start` / `compaction_end`（含 `aborted`、
-  `willRetry`）事件本就随事件流透传，`state` 帧的 `isCompacting` 同步翻转。
-- 本帧**只确认触发**（fire-and-forget）：压缩完成与否客户端以事件流与 `state` 轮询为准；
-  压缩启动失败（如未选模型）会进网关日志，`isCompacting` 不会翻转。
-- 压缩进行中提交 `message` 会得到 pi 的错误（"Cannot submit a prompt while compaction
-  is in progress"），网关按统一错误帧语义回 `bad-request`。
+  `willRetry`）事件本就随事件流透传，网关的 `isCompacting` 在受理时置位、调用收尾时复位。
+- 本帧**只确认受理**（fire-and-forget）。`isCompacting` 覆盖此次手动压缩调用的完整在途期，
+  包括 SDK 等待当前回答停止的启动期；同一会话在途重复请求只回当前状态，不再次调用 SDK。
+- 完成/失败/中止由 Pi 原生事件及最终 `state` 核实；调用收尾会主动向订阅者推送 `compact-finished` 状态通知，
+  即使启动前异常或未产生 Pi 事件也会释放 busy。断线重连可查询 `state`，无需轮询。
+  失败详情仍由 Pi 原生失败事件/网关日志提供，受理不等于成功。
+- `compact-finished` 携带 `sessionId`、`isStreaming`、`isCompacting` 及其余state字段，
+  表示手动调用已收尾，不保证成功。它是当前连接上的独立通知，不认领或释放`state`请求；
+  缺少非空`sessionId`或两项明确布尔状态的通知不应用；其余快照字段沿用state格式。
+  既有`state`请求/回执的严格关联保持。
+
+- SDK实际压缩阶段（停止当前回答之后）提交`message`会得到Pi的压缩中错误，网关回`bad-request`。
+  等待停止的启动期仍按Pi原生输入/排队语义处理；手机依据网关的完整在途状态禁用新发送。
 - 错误：`sessionId` 缺失 → `bad-request`；未知会话 → `session-not-found`。
 
 ### 4.17 `providers` / `provider-put` / `provider-delete` — 模型 provider 管理
@@ -650,6 +686,36 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 - 每连接每种查询只保留最新请求；新查询、空 token 和断连取消旧 fd。旧结果及旧错误不发送；3秒期限后发送关联 `input-timeout` 并取消搜索。两种查询分开取消。客户端仍须按查询 ID、会话/cwd 和当前编辑片段丢弃迟到帧；清空输入、切会话、重连和重载后刷新。
 - 旧 `commands` 帧语义不变；新客户端先探测 capability，没有能力时不发送远端候选请求。
 
+### 4.26 `entry-copy` — 整条 entry 的可复制全文
+
+```json
+{"type":"entry-copy","sessionId":"<uuid>","entryId":"<entryId>"}
+→ {"kind":"entry-copy","sessionId":"…","entryId":"…","bytes":1234,"text":"…全文…"}
+```
+
+- 对齐 Pi TUI 树选择器的 Ctrl+X（`app.message.copy` → `TreeList.getEntryCopyText`）：**当前选中 entry 的完整可复制文本**，不是树行的 120 字 `preview`、不是 200 字搜索窗口，也不是整条分支。
+- 文本口径逐类型对齐 SDK 1.0.4：`message`+`bashExecution` 取 `command`；其余 `message` 拼接全部 text 块（assistant 无正文时回落 `errorMessage`）；`custom_message` 取正文；`compaction`/`branch_summary` 取 `summary`。返回未 trim 的原文。
+- 其余类型（`label`、`model_change`、`thinking_level_change`、`session_info`、`context_edit`、`usage` 等）以及 trim 后为空的内容 **没有可复制文本**：回 `entry-copy-empty` 错误帧，网关不造占位文本、不退回 `preview`。
+- 只读端点：live 句柄优先，未加载时回落文件视图（文件头 `id` 是权威身份，陈旧索引解析到别的会话文件按 `session-not-found` 处理），与 §4.22 attachment 同一查找路径。
+- **超限不截断**：文本 UTF-8 字节 > 512 KiB（`ENTRY_COPY_MAX_BYTES`，与 §4.5 单消息预算同量级）时不带 `text`，只回 `{"oversized":true,"bytes":N}`。客户端必须明确报“内容过大未复制”，不能把节选当全文粘给用户。
+- 错误：`sessionId`/`entryId` 缺失或超过 256 字符 → `bad-request`；未知会话 → `session-not-found`；未知 entry → `entry-not-found`；无可复制文本 → `entry-copy-empty`。错误帧在**参数齐备时**回显 `sessionId`+`entryId`（与 attachment 同口径；缺参帧本身没有可回显的目标，只带 `requestType`），内部异常只回固定 `internal` 文案，细节进网关日志。
+
+### 4.27 `label-put` — 标签写（新增 / 修改 / 清空）
+
+```json
+{"type":"label-put","sessionId":"<uuid>","entryId":"<entryId>","label":"交付"}
+→ {"kind":"label-put","sessionId":"…","entryId":"…","label":"交付","labelEntryId":"<新LabelEntry id>","leafId":"<写入后的运行时叶子>"}
+```
+
+- 对齐 Pi TUI 的 Shift+L → `sessionManager.appendLabelChange(targetId, label)`：追加一条 `label` 类型的 `LabelEntry`，**`targetId` 指向被选中的 entry**，旧消息不改写；同一 target 多次追加时最后一条记录生效（`labelsById` 覆盖语义）。
+- `label` 缺席、`null` 或 trim 后为空串 = **清除标签**（Pi `LabelInput`：空值提交 `undefined`），应答里 `label` 为 `null`。非字符串或超过 200 字符 → `bad-request`（Pi 自身不限长，这里是 wire 护栏，不静默截断成另一个标签）。
+- **叶子会前进**：新 `LabelEntry` 以当前运行时叶子为父并成为新叶子（Pi 同一行为；标签条目不参与模型上下文，`default` 等筛选下也不显示）。网关写入后同步内部手动叶子钉子，`tree`/`history` 的活跃链以新叶子为起点；否则“显示的当前行”与“跳转目标”会错位。应答带 `leafId` 供客户端核对，客户端随后重拉 `tree`。若 SDK 随后自然追加消息/压缩条目，钉子只跟随原叶子的运行时后代，句柄回收前同步，避免截断后续回答。
+- 由此，在 `all` 筛选下重拉 `tree` 时 `leafId`/`selectedId` 会落在新 `LabelEntry` 行上（该类型仅在 `default`/`no-tools` 被隐藏）——这与 Pi 原生 `/tree` 一致（`currentLeafId` 同样指向标签条目）。客户端应以**浏览选中**为动作目标，不得把网关 `selectedId` 直接当默认跳转目标；对 `LabelEntry` 行跳转等价于 `alreadyAt`。
+- 写入必须在 **live 句柄**上进行（与 `switch-branch` 同口径）：另开一个文件视图 `SessionManager` 追加会与运行时叶子分叉。因此客户端需先 `subscribe` 打开会话；无活动句柄 → `session-not-found`，网关不隐式 `openSession`。
+- 流式/压缩进行中不额外拒绝（Pi 也允许在树选择器里改标签）；标签追加是同步写入，不与运行中的消息重排。
+- 错误：`sessionId`/`entryId` 缺失或超过 256 字符、`label` 非法 → `bad-request`；未知会话或无活动句柄 → `session-not-found`；目标 entry 不在该会话 → `entry-not-found`。错误帧在参数齐备时回显 `sessionId`+`entryId`（缺参帧只带 `requestType`）。
+- 能力宣告：`tree-actions-v1`（同时含 `entry-copy`/`label-put` 两个帧类型）。旧网关不宣告时客户端隐藏复制/标签入口，只保留浏览选中与跳转。
+
 ## 5. 管理面（localhost HTTP，不面向移动端）
 
 | 方法与路径 | 说明 |
@@ -681,3 +747,9 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 
 - `provider-model-base-url-v1`：Provider 每模型可读写独立地址，编辑/草稿测试按 §4.17 的省略/覆盖/继承语义。旧网关不宣告时客户端不显示编辑、不下发字段。
 - `model-scope-v1`：全局显式保存范围，宣告请求 `model-scope` / `model-scope-put`，契约见 §4.23；临时/项目范围不在此首版。
+
+### tree-actions-v1 兼容扩展（2026-10-15）
+
+- `tree-actions-v1`：树页动作接线，宣告请求 `entry-copy`（§4.26）/ `label-put`（§4.27）。两端点对应 Pi TUI 树选择器的 Ctrl+X 与 Shift+L，只覆盖这两个操作：不扩展时间快捷键、消息编辑/删除、筛选循环或其他维护命令。
+- 客户端只在发现 `tree-actions-v1` 后才发送这两类请求；旧网关上动作卡只显示“跳到此处”，复制/标签入口隐藏并提示升级网关。发布新 APK 不代表网关服务已更新。
+- `tree` / `switch-branch` / `tree-view-v1` 的既有语义不变；标签写会推进叶子这一点由 §4.27 明确，客户端不得把新 `LabelEntry` 当可见行或跳转目标。
