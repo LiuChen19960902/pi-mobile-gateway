@@ -1,0 +1,21 @@
+name: 功能建议
+description: 说明要解决的问题和期望行为
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决什么问题？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 期望如何使用？
+      description: 描述可观察的行为；提出建议不代表已排期。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 现有替代方式（可选）

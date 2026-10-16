@@ -1,0 +1,32 @@
+name: 问题反馈
+description: 提供可复现的问题和环境信息
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿填写密钥、配对码、真实网关地址或私人会话。安全漏洞请通过安全策略中的私有渠道报告。
+  - type: textarea
+    id: versions
+    attributes:
+      label: 版本与环境
+      description: 填写相关的 Pi Mobile、网关、Pi SDK、Android 或 Node/系统版本。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 描述最少操作，以及能否稳定复现。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期与实际表现
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏截图或日志（可选）
+      description: 分享前检查完整画面及日志，删除地址、凭据和私人内容。

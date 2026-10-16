@@ -132,6 +132,10 @@ node scripts/smoke-verify.mjs --prompt                     # 附加一条真实�
 
 协议详见 [PROTOCOL.md](PROTOCOL.md)，设计决策详见 [DESIGN.md](DESIGN.md)。
 
+## 协作与自动检查
+
+[GitHub CI](.github/workflows/ci.yml)在Linux上执行上节的类型、lint和单测检查，单测按文件串行运行。CI使用隔离配置，不需要真实Provider密钥。提交PR时说明实际验证；协议变化需同步手机端及跨仓一致性测试。依赖更新通过PR处理，不自动合并。
+
 ## 限制
 
 - 日常验证环境为 Windows + WSL2。另在 Ubuntu 26.04.1 / x86_64 / Node.js 24.21.0（已配置 `fd`）验证过 gateway 0.3.0 的较早快照：安装、配对、Provider 配置、真实聊天、工具及历史主路径通过；最新树页动作和手动压缩未在该机复验。纯 Windows、macOS 和其他 Linux 环境未验证。
