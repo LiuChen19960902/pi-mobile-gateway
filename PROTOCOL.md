@@ -204,6 +204,8 @@
 直接映射 pi 的事件类型（与 pi 自家 RPC stdout 协议同形）：
 `agent_start`、`agent_end`、`agent_settled`、`message_start`、`message_update`、`message_end`、`tool_execution_start`、`tool_execution_update`、`tool_execution_end`、`queue_update`、`compaction_start`、`compaction_end`、`auto_retry_start/end`、`summarization_retry_*`、`bash_execution_update`、`entry_appended`、`session_info_changed`、`thinking_level_changed`、`extension_error`…
 
+SDK 1.3.0 的 `agent_settled` 带布尔字段 `aborted`，网关随原生事件透传；运行终态仍由该事件及权威状态确认。
+
 带宽投影（两处，均为 pi-web 同款裁剪）：
 
 | 事件 | 裁剪 |
@@ -293,7 +295,7 @@ pi 把一条消息（`user`/`assistant`/`toolResult` 角色）持久化到 `Sess
 
 等待会话真正空闲后应答，并附当前 state 形状。会话未加载（必不在运行）也返回空闲快照。
 
-`restoreQueued:true` 对齐 Pi TUI Esc：在同会话 prompt admission 串行区内，先用公开 SDK `clearQueue()` 取走尚未消费的 steering/followUp 文本，再中止运行；`queued` 按 steering→followUp 顺序返回，客户端以双换行合并到当前草稿之前，不自动重发。`queuedMessages` 是清理后的当前队列，不能和取回载荷 `queued` 混用。`queue_update` 仍是原生事件，不伪造 Agent 终态；空闲残留队列也可取回。SDK 1.0.4 的取回 API 仅返回文本，不承诺排队图片恢复。断线丢失回执时不能保证取回内容跨连接恢复。
+`restoreQueued:true` 对齐 Pi TUI Esc：在同会话 prompt admission 串行区内，先用公开 SDK `clearQueue()` 取走尚未消费的 steering/followUp 文本，再中止运行；`queued` 按 steering→followUp 顺序返回，客户端以双换行合并到当前草稿之前，不自动重发。`queuedMessages` 是清理后的当前队列，不能和取回载荷 `queued` 混用。`queue_update` 仍是原生事件，不伪造 Agent 终态；空闲残留队列也可取回。SDK 1.3.0 的取回 API 仅返回文本，不承诺排队图片恢复。断线丢失回执时不能保证取回内容跨连接恢复。
 
 省略/false 保留旧版只停止语义，不清队列，也不返回 `queued`，避免旧客户端无法接收文本而丢稿。旧网关忽略该请求扩展时只回旧 `aborted`，新客户端不得凭本地队列快照假装已撤销。
 
@@ -469,7 +471,7 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 ```
 
 - `filter` 必填：`default`、`no-tools`、`user-only`、`labeled-only`、`all`；`search` 为字符串，`foldedIds` 为非空条目ID字符串数组。非法参数返回 `bad-request`，不静默降级。
-- 有 `view` 时按锁定 Pi SDK 1.0.4 的 `/tree` 规则筛选、排序、折叠并重新计算可见祖先和前缀，返回全部匹配节点，不使用旧400条窗口。请求不带 `view` 时保留旧投影与上限，兼容已有客户端。
+- 有 `view` 时按锁定 Pi SDK 1.3.0 的 `/tree` 规则筛选、排序、折叠并重新计算可见祖先和前缀，返回全部匹配节点，不使用旧400条窗口。请求不带 `view` 时保留旧投影与上限，兼容已有客户端。
 - 默认隐藏 label/custom/model_change/thinking_level_change/session_info，保留工具结果、摘要、自定义消息等；纯工具/空白 assistant 除当前叶或异常结束外在所有模式均隐藏。`display=false` 不作为树过滤条件（与 Pi 树一致，独立于对话消息可见性）。
 - 搜索不区分大小写，空白分词后 AND 匹配；按 Pi `getSearchableText` 使用标签、角色与类型特定正文。普通消息正文取前200字符，自定义消息字符串/摘要等遵循SDK各自规则，并非无限全文搜索。
 - 新响应回显 `view`，附 `selectedId`（当前叶若不可见则最近可见祖先，否则末行；空结果为null）。每个节点附 `displayText`（Pi行正文的无ANSI版本，正文/角色标记已包含）、`foldable`、`folded`。客户端不再次解析Markdown或追加角色前缀。
@@ -644,7 +646,7 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 
 ### 4.23 `model-scope` / `model-scope-put` — 全局保存的模型范围
 
-能力为`model-scope-v1`，与Provider定义及会话当前模型分开。只读请求`{"type":"model-scope"}`返回`{"kind":"model-scope","scope":{...}}`：scope包含原始`patterns`、未按scope过滤的可用目录`groups`（同models白名单）、已解析的`selected`（provider/modelId/可选thinkingLevel）与`unmatchedPatterns`。空或全无匹配范围按Pi默认选中全部可用模型；未匹配的旧条目单列，不能静默丢掉。
+能力为`model-scope-v1`，与Provider定义及会话当前模型分开。只读请求`{"type":"model-scope"}`返回`{"kind":"model-scope","scope":{...}}`：scope包含原始`patterns`、未按scope过滤的可用目录`groups`（同models白名单）、已解析的`selected`（provider/modelId/可选thinkingLevel）与`unmatchedPatterns`。空或全无匹配范围按Pi默认选中全部可用模型；未匹配的旧条目单列，不能静默丢掉。 精确引用、裸ID歧义、思考后缀和通配符直接使用锁定Pi SDK的公开解析器；裸ID匹配多个Provider时保留官方解析出的全部模型，不另设大小写优先规则。读取、菜单、保存回执和新会话初始化采用相同规则。
 
 显式保存请求：`{"type":"model-scope-put","scopeRequestId":"本次标记","expectedPatterns":["原始条目"],"models":[{"provider":"relay","modelId":"example","thinkingLevel":"medium"}],"preserveUnmatched":true,"reset":false}`。按勾选顺序写具体`provider/model[:thinkingLevel]`，不自动新增provider通配符；preserveUnmatched仅保留读取时既有的无匹配条目。reset=true明确恢复Pi默认范围（enabledModels=[]），不是零个可用模型；非reset空选拒绝。
 
@@ -694,7 +696,7 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 ```
 
 - 对齐 Pi TUI 树选择器的 Ctrl+X（`app.message.copy` → `TreeList.getEntryCopyText`）：**当前选中 entry 的完整可复制文本**，不是树行的 120 字 `preview`、不是 200 字搜索窗口，也不是整条分支。
-- 文本口径逐类型对齐 SDK 1.0.4：`message`+`bashExecution` 取 `command`；其余 `message` 拼接全部 text 块（assistant 无正文时回落 `errorMessage`）；`custom_message` 取正文；`compaction`/`branch_summary` 取 `summary`。返回未 trim 的原文。
+- 文本口径逐类型对齐 SDK 1.3.0：`message`+`bashExecution` 取 `command`；其余 `message` 拼接全部 text 块（assistant 无正文时回落 `errorMessage`）；`custom_message` 取正文；`compaction`/`branch_summary` 取 `summary`。返回未 trim 的原文。
 - 其余类型（`label`、`model_change`、`thinking_level_change`、`session_info`、`context_edit`、`usage` 等）以及 trim 后为空的内容 **没有可复制文本**：回 `entry-copy-empty` 错误帧，网关不造占位文本、不退回 `preview`。
 - 只读端点：live 句柄优先，未加载时回落文件视图（文件头 `id` 是权威身份，陈旧索引解析到别的会话文件按 `session-not-found` 处理），与 §4.22 attachment 同一查找路径。
 - **超限不截断**：文本 UTF-8 字节 > 512 KiB（`ENTRY_COPY_MAX_BYTES`，与 §4.5 单消息预算同量级）时不带 `text`，只回 `{"oversized":true,"bytes":N}`。客户端必须明确报“内容过大未复制”，不能把节选当全文粘给用户。

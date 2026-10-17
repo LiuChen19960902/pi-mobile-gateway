@@ -20,7 +20,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { type AgentSessionEvent, SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+	type AgentSessionEvent,
+	type ModelRuntime,
+	resolveModelScopeWithDiagnostics,
+	SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import {
 	AttachmentInvalidError,
 	AttachmentNotFoundError,
@@ -110,6 +115,52 @@ describe("真实会话工厂的配置新鲜度", () => {
 			timeout: 15_000,
 		});
 		assert.deepEqual(JSON.parse(output), ["model-a", "model-b"]);
+	});
+
+	it("不同 Provider 同名模型在真实 SDK 范围与新会话初始化中保持一致", () => {
+		const root = tempDir("pi-mgw-real-case-scope-");
+		const agentDir = join(root, "agent");
+		const cwd = join(root, "project");
+		mkdirSync(agentDir);
+		mkdirSync(cwd);
+		const provider = {
+			baseUrl: "http://127.0.0.1:9/v1",
+			apiKey: "test-placeholder",
+			models: [{ id: "chat", api: "openai-completions", reasoning: false, input: ["text"] }],
+		};
+		writeFileSync(
+			join(agentDir, "models.json"),
+			JSON.stringify({ providers: { "relay-a": provider, "relay-b": provider } }),
+		);
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ enabledModels: ["relay-b/chat"] }));
+		const runtimeModule = new URL("../src/pi-runtime.ts", import.meta.url).href;
+		const script = `
+			import assert from 'node:assert/strict';
+			import { join } from 'node:path';
+			import { PiRuntime } from ${JSON.stringify(runtimeModule)};
+			globalThis.fetch = async () => { throw new Error('本测试禁止网络请求'); };
+			const agentDir = process.env.PI_CODING_AGENT_DIR;
+			const runtime = new PiRuntime({ agentDir, sessionDir: join(agentDir, 'sessions') });
+			try {
+				const scope = await runtime.modelScope();
+				assert.deepEqual(scope.selected.map(m => m.provider), ['relay-b']);
+				assert.deepEqual((await runtime.listModels()).map(g => g.provider), ['relay-b']);
+				const first = await runtime.createSession(process.cwd());
+				assert.equal(first.session.model?.provider, 'relay-b');
+				const saved = await runtime.saveModelScope(scope.patterns, [{provider:'relay-a',modelId:'chat'}], false, false);
+				assert.deepEqual(saved.selected.map(m => m.provider), ['relay-a']);
+				assert.equal(first.session.model?.provider, 'relay-b');
+				const second = await runtime.createSession(process.cwd());
+				console.log(JSON.stringify([first.session.model?.provider, second.session.model?.provider]));
+			} finally { runtime.disposeAll(); }
+		`;
+		const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+			cwd,
+			env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" },
+			encoding: "utf8",
+			timeout: 15_000,
+		});
+		assert.deepEqual(JSON.parse(output), ["relay-b", "relay-a"]);
 	});
 });
 
@@ -1282,7 +1333,8 @@ describe("PiRuntime: tree stale manual leaf", () => {
 
 function fakeRegistry(): ModelRegistryLike {
 	return {
-		getAvailable: () => Promise.resolve(CATALOG_MODELS),
+		// Pi getAvailable 的模型都有 ID；损坏目录投影另在无范围的用例中注入。
+		getAvailable: () => Promise.resolve(CATALOG_MODELS.filter((model) => model.id !== undefined)),
 		getModel: (provider, modelId) =>
 			CATALOG_MODELS.find((model) => model.provider === provider && model.id === modelId),
 	};
@@ -1412,7 +1464,10 @@ describe("PiRuntime: 配置面门控（外部改文件后生效）", () => {
 describe("PiRuntime: model catalog and switching", () => {
 	it("groups available models by provider and derives supported thinking levels", async () => {
 		const sessionDir = tempDir("pi-mgw-sessions-");
-		const { runtime } = fakeRuntime({ sessionDir, modelRegistry: fakeRegistry() });
+		const { runtime } = fakeRuntime({
+			sessionDir,
+			modelRegistry: { ...fakeRegistry(), getAvailable: async () => CATALOG_MODELS },
+		});
 		const groups = await runtime.listModels();
 		assert.deepEqual(
 			groups.map((group) => group.provider),
@@ -1489,6 +1544,94 @@ describe("PiRuntime: model catalog and switching", () => {
 		assert.deepEqual(reset.patterns, []);
 		assert.equal(reset.selected.length, valid.length);
 		assert.equal((await runtime.listModels()).length, 3);
+	});
+
+	it("大小写冲突范围保存和重读与 Pi 官方解析一致", async () => {
+		const agentDir = tempDir("pi-mgw-case-scope-");
+		const settingsPath = join(agentDir, "settings.json");
+		writeFileSync(settingsPath, JSON.stringify({ enabledModels: ["p1/m1"], theme: "light" }));
+		const models = [
+			{ ...CATALOG_MODELS[0], provider: "p1", id: "m1" },
+			{ ...CATALOG_MODELS[0], provider: "deepseek", id: "deepseek-flash" },
+			{ ...CATALOG_MODELS[0], provider: "Deepseek", id: "deepseek-flash" },
+		];
+		const runtime = new PiRuntime({
+			agentDir,
+			sessionDir: tempDir("pi-mgw-case-sessions-"),
+			modelRegistry: {
+				getAvailable: async () => models,
+				getModel: (provider, id) => models.find((model) => model.provider === provider && model.id === id),
+			},
+		});
+		runtimes.push(runtime);
+		const snapshot = await runtime.modelScope();
+		const picks = [snapshot.selected[0], { provider: "Deepseek", modelId: "deepseek-flash", thinkingLevel: "high" }];
+		const saved = await runtime.saveModelScope(snapshot.patterns, picks, true, false);
+		assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), {
+			enabledModels: ["p1/m1", "Deepseek/deepseek-flash:high"],
+			theme: "light",
+		});
+		const native = await resolveModelScopeWithDiagnostics(saved.patterns, {
+			getAvailable: async () => models,
+		} as unknown as ModelRuntime);
+		const expected = native.scopedModels.map(({ model, thinkingLevel }) => ({
+			provider: model.provider,
+			modelId: model.id,
+			thinkingLevel,
+		}));
+		assert.deepEqual(saved.selected, expected);
+		assert.deepEqual(saved.unmatchedPatterns, []);
+		assert.deepEqual((await runtime.modelScope()).selected, expected);
+		assert.deepEqual(
+			(await runtime.listModels()).flatMap((g) => g.models.map((m) => `${g.provider}/${m.id}`)).sort(),
+			expected.map((m) => `${m.provider}/${m.modelId}`).sort(),
+		);
+	});
+
+	it("模型全名、裸 ID 歧义、冒号和通配符全部沿用 Pi 官方范围结果", async () => {
+		const models = [
+			{ ...CATALOG_MODELS[0], provider: "p1", id: "m1" },
+			{ ...CATALOG_MODELS[0], provider: "relay-a", id: "chat" },
+			{ ...CATALOG_MODELS[0], provider: "relay-b", id: "chat" },
+			{ ...CATALOG_MODELS[0], provider: "relay-a", id: "chat:high" },
+			{ ...CATALOG_MODELS[0], provider: "relay-b", id: "chat:high" },
+		];
+		let patterns: string[] = [];
+		const registry = {
+			getAvailable: async () => models,
+			getModel: (provider: string, id: string) =>
+				models.find((model) => model.provider === provider && model.id === id),
+		};
+		const { runtime } = fakeRuntime({ modelRegistry: registry, enabledModelsLoader: () => patterns });
+		for (const next of [
+			["relay-b/chat", "relay-a/chat"],
+			["chat"],
+			["chat:high"],
+			["relay-b/chat:high:max", "relay-a/chat:high", "p1/*", "missing/model"],
+			["relay-*/chat:high"],
+		]) {
+			patterns = next;
+			const native = await resolveModelScopeWithDiagnostics(patterns, registry as unknown as ModelRuntime);
+			const expected = native.scopedModels.map(({ model, thinkingLevel }) => ({
+				provider: model.provider,
+				modelId: model.id,
+				thinkingLevel,
+			}));
+			const snapshot = await runtime.modelScope();
+			assert.deepEqual(snapshot.selected, expected, patterns.join(","));
+			assert.deepEqual(
+				snapshot.unmatchedPatterns,
+				native.diagnostics.filter((d) => d.code === "no-match").map((d) => d.pattern),
+			);
+			assert.deepEqual(
+				(await runtime.listModels()).flatMap((g) => g.models.map((m) => `${g.provider}/${m.id}`)).sort(),
+				expected.map((m) => `${m.provider}/${m.modelId}`).sort(),
+			);
+			if (patterns.length === 1 && patterns[0] === "chat") {
+				assert.equal(native.scopedModels.length, 2);
+				assert.equal(native.diagnostics[0].code, "ambiguous");
+			}
+		}
 	});
 
 	it("scope writes reject stale snapshots, unavailable/duplicate/empty picks, and confirm actual persistence", async () => {

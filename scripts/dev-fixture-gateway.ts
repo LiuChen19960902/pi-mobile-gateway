@@ -132,7 +132,7 @@ class ScriptedSession implements PiSessionLike {
 			this.emit({ type: "message_end", message: assistantMessage } as AgentSessionEvent);
 			this.manager.appendMessage(assistantMessage);
 		});
-		this.schedule(200, () => this.emit({ type: "agent_settled" } as AgentSessionEvent));
+		this.schedule(200, () => this.emit({ type: "agent_settled", aborted: this.aborted } as AgentSessionEvent));
 		this.schedule(210, () => this.emit({ type: "agent_end", messages: [], willRetry: false } as AgentSessionEvent));
 		return Promise.resolve();
 	}
@@ -143,7 +143,7 @@ class ScriptedSession implements PiSessionLike {
 		for (const timer of this.timers) clearTimeout(timer);
 		this.timers.length = 0;
 		this.isStreaming = false;
-		this.emit({ type: "agent_settled" } as AgentSessionEvent);
+		this.emit({ type: "agent_settled", aborted: this.aborted } as AgentSessionEvent);
 		this.emit({ type: "agent_end", messages: [], willRetry: false } as AgentSessionEvent);
 		return Promise.resolve();
 	}
