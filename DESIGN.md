@@ -148,7 +148,7 @@ dsh 的网关做成插件，是因为 `dsh web` 本身常驻 Web 服务器，插
 手机端树页采用“点行只浏览选中并弹动作卡”，复制/标签/跳转三个动作分别接线：
 
 - **跳转**仍走既有 `switch-branch`，语义不变（`summarize:false`、排队取回、user 节点返回 editorText；assistant 节点仅导航，不回填其正文）；取消动作卡不产生任何导航。
-- **复制**用新 `entry-copy`（§4.26）：文本口径逐类型对齐 SDK 1.0.4 的 `TreeList.getEntryCopyText`（TUI Ctrl+X），取整条 entry 的全文而不是 120 字 `preview`；没有可复制文本的簿记条目回 `entry-copy-empty`，超 512 KiB 只回 `oversized`+`bytes`，两端都不静默截断成“全文”。只读，因此允许文件视图回落（与 `attachment` 同一查找路径）。
+- **复制**用新 `entry-copy`（§4.26）：文本口径逐类型对齐 SDK 1.3.0 的 `TreeList.getEntryCopyText`（TUI Ctrl+X），取整条 entry 的全文而不是 120 字 `preview`；没有可复制文本的簿记条目回 `entry-copy-empty`，超 512 KiB 只回 `oversized`+`bytes`，两端都不静默截断成“全文”。只读，因此允许文件视图回落（与 `attachment` 同一查找路径）。
 - **标签**用新 `label-put`（§4.27）：对齐 Shift+L 的 `appendLabelChange(targetId, label)`——只追加 `LabelEntry`、`targetId` 指向被选中条目、同一 target 最后一条记录生效、空值即清除。追加会推进运行时叶子，网关写完同步内部手动叶子钉子，`tree` 的 `leafId`/`selectedId` 因此不会把隐藏的标签条目当成当前行或跳转目标。写入必须在 live 句柄上（另开文件视图 `SessionManager` 追加会与运行时叶子分叉），无活动句柄回 `session-not-found`。
 - 范围只覆盖这两个操作：不扩展时间快捷键、消息编辑/删除、筛选循环或其他维护命令；标签长度上限 200 字符是 wire 护栏（Pi 自身只 trim 不限长），手机端输入框另限 24 字符。
 - 旧网关不宣告 `tree-actions-v1` 时，客户端隐藏复制/标签入口，只保留浏览选中与跳转。
