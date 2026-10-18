@@ -441,10 +441,9 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 {"type":"provider-delete","id":"relayA"}
 → {"kind":"provider-deleted","id":"relayA","refreshed":true}
 
-{"type":"provider-test","id":"relayA","model":"m1"}
-→ {"kind":"provider-test-result","id":"relayA","ok":false,"latencyMs":210,"httpStatus":200,
-   "url":"https://relay.example/chat/completions",
-   "error":"该地址返回的是网页而不是 API 响应（…）——常见原因是 baseUrl 少了 /v1 等路径段，或填成了站点首页"}
+{"type":"provider-test","id":"relayA","model":"m1","providerTestId":"probe-1"}
+→ {"kind":"provider-test-result","id":"relayA","providerTestId":"probe-1","ok":false,"latencyMs":210,"httpStatus":200,
+   "code":"html-response","failureKind":"config","error":"地址返回了网页"}
 ```
 
 - `providers` 读出**不回传 apiKey 原文**（只给 `apiKeySet` 布尔）；`baseUrl`/`api`/每个模型的 `thinkingLevelMap` 与 `compat` 原样返回，供 App 表单回显；
@@ -454,7 +453,10 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 - **协议层级（App 契约）**：wire 协议属于**模型级**（pi 的解析顺序 `model.api` > `provider.api` > 内置默认，运行时只按 `model.api` 分派流实现），App 把协议**逐模型**写入 `api`（同一 provider 下可混用多种 API，例如中转站的 GPT 走 `openai-completions`、Claude 走 `anthropic-messages`），`provider-put` 不发 provider 级 `api`（缺省保留原值）。网关仍兼容 provider 级 `api` 字段（供手编/目录刷新数据）；App 回显时以模型级 `api` 为准，模型未写才回退到 provider 级，保证改表单不会静默改变生效协议；compat 键集跟随该模型自己的协议。
 - Provider保存不自动追加`providerId/*`到settings.enabledModels；模型定义与/model默认scope分别管理。旧admitted字段仍可被旧客户端读取，新应答省略该字段。手机视图调序也不写宿主模型顺序；
 - **enabledModels 的删除同步**：保存时不追加范围；本次编辑里**被删掉的模型行**会把它们的**具体** pattern（`providerId/<模型id>`）一并清掉，`provider-delete` 则清掉该 provider 的**所有** pattern（`providerId/*` 与 `providerId/<模型id>`）。否则只会留永不命中的死 pattern（具体模型 pattern 不含通配符、不走 glob，所属模型没了就彻底无用）；
-- `provider-test`：用 pi 的方式真发一条最小对话请求，把“这个 provider 现在能不能用”折算成可展示结论。字段缺省时回退到 models.json 已存值（`id` + 已存 apiKey/baseUrl/首个模型），**编辑场景不要求用户重填 apiKey**；不填 `id` 则只测不落状态（表单预览）。各协议**逐字复刻 pi 的请求方式**：`openai-completions` 走 OpenAI SDK 的 `baseURL + /chat/completions`（**baseUrl 必须自带 `/v1`**）；`anthropic-messages` 走 Anthropic SDK 的 `baseURL + /v1/messages`（**baseUrl 不带 `/v1`**，由 SDK 补）；`google-generative-ai` 为 `baseUrl + /models/{id}:generateContent`（baseUrl 已含版本段）。200 但返回网页 HTML 时单独提示“返回的是网页而不是 API 响应”（baseUrl 少路径段的典型症状，不测试根本看不出来）；200 但 body 含 `error` 键同样判失败（兼容 `{"error":"str"}` 与无 message 的错误体）。请求不流式、不跟随重定向、12s 超时、响应体流式读取上限 64KiB（读到即断）。
+- `provider-test` 使用当前草稿的有效模型 ID、协议、地址与凭据发送一次最小非流式生成请求；缺省字段按已存配置回退，编辑时不要求重填 Key。支持 `openai-completions`、`openai-responses`、`anthropic-messages`、`google-generative-ai`；未知协议明确返回 `unsupported-api`，不猜测兼容协议。按协议拼接请求路径，不自动增删 `/v1`。请求不跟随重定向，12s 超时，响应体上限 64KiB。
+- 测通要求 HTTP 成功且存在对应协议的有效模型输出；空 JSON、模型清单、网页、纯文本、错误体不能算成功。它只验证最小模型请求，不认证流式、工具、图片、思考档位或容量上限。
+- `provider-test-id-v1` 宣告逐探针关联：请求可携带 `providerTestId`（1–128 字符）；成功/失败结果和关联错误均原样回显。旧客户端省略该字段仍兼容；新客户端要求该能力，以标识匹配当前请求，超时后迟到回执不能认证下一次测试。诊断字段本身不作为请求标识。
+- 测试响应保留 `ok`、`latencyMs`、`httpStatus?`、`failureKind?`，失败新增可选 `code` 和短 `error`；不回显地址、重定向目标或原始上游错误。`code` 可为 `invalid-url`、`missing-model`、`unsupported-api`、`auth-rejected`、`access-denied`、`not-found`、`payment-required`、`rate-limited`、`upstream-error`、`request-rejected`、`model-unavailable`、`insufficient-quota`、`redirect`、`html-response`、`invalid-response`、`timeout`、`dns-failed`、`tls-failed`、`connection-refused`、`network-error`。客户端按稳定码及状态码组织诊断；旧网关没有 `code` 时按状态码降级，不展示原始错误。
 - `provider-put` 成功后，连接配置（公共/模型地址、API、Key、headers、模型集合）改变时清除过期诊断，恢复“无记录＝激活”；仅改名称、窗口或其他数值元数据时保留状态。草稿测试结果只给当前表单通行证，不提前认证另一份已存配置；保存后不自动再测，避免重复真实请求。
 - `refreshed:false`（两个应答都带）表示网关触发 pi **重读 models.json 未完全成功**：refresh 抛错，或 pi 报出模型配置错误。注意 pi 对坏 models.json **不抛错**（`ModelConfig.load` 返回带 error 的空配置、目录静默降级为空），因此网关在 refresh 后另读 `getError()` 才能区分“真刷新成功”与“静默降级”。两种情况保存/删除均已落盘，但运行时目录可能未更新，可在电脑端检查 models.json 后重启网关；缺省视为 `true`（旧网关无此字段，旧客户端忽略）。
 - `provider-delete` 删除未知 id → `bad-request`；同步移除 `providerId/*` pattern（清理已失效pattern；不自动收录新增模型）；同时清除该 provider 的测试状态；
