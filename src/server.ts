@@ -212,6 +212,7 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 								"model-scope-put",
 								"model-scope-v1",
 								"provider-model-base-url-v1",
+								"provider-test-id-v1",
 								"set-model",
 								"directories",
 								"directory-create",
@@ -246,6 +247,7 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 						| "provider-catalog-v1"
 						| "model-scope-v1"
 						| "provider-model-base-url-v1"
+						| "provider-test-id-v1"
 						| "prompt-disposition-v1"
 						| "ping-id"
 					)[],

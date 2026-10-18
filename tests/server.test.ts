@@ -546,6 +546,7 @@ describe("hello capabilities advertisement", () => {
 				"ping-id",
 				"model-scope-v1",
 				"provider-model-base-url-v1",
+				"provider-test-id-v1",
 				"prompt-disposition-v1",
 			].sort(),
 			"capabilities 必须与 ClientFrameType 全量一致",

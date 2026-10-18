@@ -48,7 +48,7 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 			(result, request) => {
 				assert.equal(result.ok, false);
 				assert.equal(request.url, "https://h.example/v1/v1/messages");
-				assert.match(result.error ?? "", /重复包含\/v1/);
+				assert.equal(result.code, "not-found");
 				assert.doesNotMatch(result.error ?? "", /少了 \/v1/);
 			},
 			{ baseUrl: "https://h.example/v1", api: "anthropic-messages", modelId: "claude" },
@@ -85,24 +85,94 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 		}
 	});
 
-	it("200 + 正常 JSON 不再依赖 error 子串猜测（只认 error 键）", async () => {
-		// 顶层 message 字段且文本里出现 error 字样：不应误判为失败。
+	it("合法JSON也必须有模型输出，普通对象或清单不能假绿", async () => {
+		for (const body of [
+			"{}",
+			"[]",
+			'{"model":"m1","message":"no errors here"}',
+			'{"data":[{"id":"m1"}]}',
+			'{"choices":[]}',
+		]) {
+			await withFetch(
+				() => new Response(body, { status: 200 }),
+				(result) => {
+					assert.equal(result.ok, false);
+					assert.equal(result.code, "invalid-response");
+				},
+				{ baseUrl: "https://h.example/v1", modelId: "m1" },
+			);
+		}
 		await withFetch(
-			() => new Response('{"model":"m1","message":"no errors here"}', { status: 200 }),
+			() => new Response('{"choices":[{"message":{"content":"no errors here"}}]}'),
 			(result) => assert.equal(result.ok, true),
-			{ baseUrl: "https://h.example/v1", apiKey: "sk-x", modelId: "m1" },
+			{ baseUrl: "https://h.example/v1", modelId: "m1" },
+		);
+	});
+
+	it("区分网络与上游拒绝，所有诊断不回显地址、密钥或上游原文", async () => {
+		for (const [networkCode, diagnostic] of [
+			["ENOTFOUND", "dns-failed"],
+			["ECONNREFUSED", "connection-refused"],
+			["CERT_HAS_EXPIRED", "tls-failed"],
+			["ECONNRESET", "network-error"],
+		]) {
+			await withFetch(
+				() => {
+					throw new TypeError("https://secret.example/private-key", {
+						cause: Object.assign(new Error("private-key"), { code: networkCode }),
+					});
+				},
+				(result) => {
+					assert.equal(result.code, diagnostic);
+					assert.equal(result.failureKind, "transient");
+					assert.doesNotMatch(JSON.stringify(result), /secret|private-key/);
+				},
+				{ baseUrl: "https://secret.example/v1", apiKey: "private-key", modelId: "m" },
+			);
+		}
+		for (const [status, diagnostic] of [
+			[401, "auth-rejected"],
+			[403, "access-denied"],
+			[402, "payment-required"],
+			[429, "rate-limited"],
+			[503, "upstream-error"],
+			[400, "request-rejected"],
+		] as const) {
+			await withFetch(
+				() => new Response('{"error":{"message":"secret private-key https://secret.example"}}', { status }),
+				(result) => {
+					assert.equal(result.code, diagnostic);
+					assert.equal(result.httpStatus, status);
+					assert.ok(result.latencyMs >= 0);
+					assert.doesNotMatch(JSON.stringify(result), /secret|private-key/);
+				},
+				{ baseUrl: "https://secret.example/v1", modelId: "m" },
+			);
+		}
+	});
+
+	it("未知协议不借用OpenAI端点，200错误体保留稳定归因", async () => {
+		const unknown = await testProvider({ baseUrl: "https://h.example", api: "unknown-api", modelId: "m" });
+		assert.equal(unknown.code, "unsupported-api");
+		await withFetch(
+			() => new Response('{"error":{"code":"model_not_found","message":"private"}}'),
+			(result) => {
+				assert.equal(result.ok, false);
+				assert.equal(result.code, "model-unavailable");
+			},
+			{ baseUrl: "https://h.example/v1", modelId: "m" },
 		);
 	});
 
 	it("超时与截断响应都归入可展示结论", async () => {
 		await withFetch(
 			() => {
-				const error = new Error("The operation was aborted due to timeout");
+				const error = new DOMException("synthetic timeout", "TimeoutError");
 				throw error;
 			},
 			(result) => {
 				assert.equal(result.ok, false);
-				assert.match(result.error ?? "", /超时|无法连接/);
+				assert.match(result.error ?? "", /超时|网络连接失败/);
 			},
 			{ baseUrl: "https://h.example/v1", apiKey: "sk-x", modelId: "m1" },
 		);
@@ -111,7 +181,7 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 			() => new Response(`<!doctype html>${"x".repeat(200_000)}`, { status: 200 }),
 			(result) => {
 				assert.equal(result.ok, false);
-				assert.match(result.error ?? "", /网页而不是 API 响应/);
+				assert.match(result.error ?? "", /返回了网页/);
 			},
 			{ baseUrl: "https://h.example/v1", apiKey: "sk-x", modelId: "m1" },
 		);
@@ -122,8 +192,8 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 			() => new Response("<!doctype html><html><head><title>网关首页</title></head></html>", { status: 200 }),
 			(result) => {
 				assert.equal(result.ok, false);
-				assert.match(result.error ?? "", /网页而不是 API 响应/);
-				assert.match(result.error ?? "", /\/v1/);
+				assert.match(result.error ?? "", /返回了网页/);
+				assert.equal(result.code, "html-response");
 			},
 			{ baseUrl: "https://h.example/", apiKey: "sk-x", modelId: "m1" },
 		);
@@ -134,8 +204,8 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 			() => new Response('{"error":{"message":"invalid api key"}}', { status: 401 }),
 			(result) => {
 				assert.equal(result.ok, false);
-				assert.match(result.error ?? "", /认证失败/);
-				assert.match(result.error ?? "", /invalid api key/);
+				assert.equal(result.code, "auth-rejected");
+				assert.doesNotMatch(JSON.stringify(result), /invalid api key/);
 			},
 			{ baseUrl: "https://h.example/v1", apiKey: "bad", modelId: "m1" },
 		);
@@ -143,7 +213,7 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 			() => new Response("not found", { status: 404 }),
 			(result) => {
 				assert.equal(result.ok, false);
-				assert.match(result.error ?? "", /端点不存在/);
+				assert.match(result.error ?? "", /接口或模型不存在/);
 			},
 			{ baseUrl: "https://h.example/v1", apiKey: "sk-x", modelId: "m1" },
 		);
@@ -171,7 +241,7 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 			(result) => {
 				assert.equal(result.ok, false);
 				assert.equal(result.failureKind, "transient");
-				assert.match(result.error ?? "", /无法连接|超时/);
+				assert.match(result.error ?? "", /网络连接失败|超时/);
 			},
 			{ baseUrl: "https://h.example/v1", apiKey: "sk-x", modelId: "m1" },
 		);
@@ -183,7 +253,11 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 				const body = JSON.parse(String(init.body));
 				const valid = url.endsWith("/responses") && Array.isArray(body.input) && body.max_output_tokens >= 16;
 				return new Response(
-					JSON.stringify(valid ? { output: [] } : { error: { message: "unsupported endpoint or payload" } }),
+					JSON.stringify(
+						valid
+							? { output: [{ type: "message", content: [{ type: "output_text", text: "pong" }] }] }
+							: { error: { message: "unsupported endpoint or payload" } },
+					),
 					{ status: valid ? 200 : 404 },
 				);
 			},
@@ -205,8 +279,9 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 
 	it("anthropic / google 协议走各自的端点与鉴权头", async () => {
 		await withFetch(
-			() => new Response("{}", { status: 200 }),
-			(_result, request) => {
+			() => new Response('{"type":"message","content":[{"type":"text","text":"pong"}]}', { status: 200 }),
+			(result, request) => {
+				assert.equal(result.ok, true);
 				// Anthropic SDK 自拼 /v1/messages（客户端 baseURL 不含 /v1）。
 				assert.equal(request.url, "https://h.example/v1/messages");
 				assert.equal((request.init.headers as Record<string, string>)["x-api-key"], "sk-x");
@@ -215,8 +290,9 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 			{ baseUrl: "https://h.example", apiKey: "sk-x", api: "anthropic-messages", modelId: "m1" },
 		);
 		await withFetch(
-			() => new Response("{}", { status: 200 }),
-			(_result, request) => {
+			() => new Response('{"candidates":[{"content":{"parts":[{"text":"pong"}]}}]}', { status: 200 }),
+			(result, request) => {
+				assert.equal(result.ok, true);
 				assert.equal(
 					request.url,
 					"https://h.example/v1/models/m1:generateContent".replace("m1", encodeURIComponent("m1")),
@@ -231,7 +307,7 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 		assert.equal((await testProvider({ baseUrl: "ftp://x", modelId: "m1" })).ok, false);
 		const noModel = await testProvider({ baseUrl: "https://h.example/v1", modelId: "  " });
 		assert.equal(noModel.ok, false);
-		assert.match(noModel.error ?? "", /模型 id/);
+		assert.match(noModel.error ?? "", /模型 ID/);
 	});
 
 	it("失败归因：配置类 vs 临时类（后者不得禁用 provider）", async () => {
@@ -251,7 +327,7 @@ describe("testProvider：把上游表现折算成可展示结论", () => {
 		// 超时 / 5xx / 429 → transient：上游问题，不得把 provider 标成未连通。
 		assert.equal(
 			await kindOf(() => {
-				throw new Error("The operation was aborted due to timeout");
+				throw new DOMException("synthetic timeout", "TimeoutError");
 			}, base),
 			"transient",
 		);

@@ -2199,6 +2199,48 @@ describe("router: provider management (models.json)", () => {
 		}
 	});
 
+	it("provider-test 回显每次探针标识，失败与校验错误不会丢失归属", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		const originalFetch = globalThis.fetch;
+		try {
+			let status = 200;
+			globalThis.fetch = (async () =>
+				new Response(status === 200 ? '{"choices":[{"message":{"content":"pong"}}]}' : '{"error":"synthetic"}', {
+					status,
+				})) as typeof fetch;
+			for (const [providerTestId, expectedOk] of [
+				["probe-success", true],
+				["probe-failure", false],
+			] as const) {
+				status = expectedOk ? 200 : 401;
+				client.send(
+					JSON.stringify({ type: "provider-test", providerTestId, baseUrl: "https://probe.example/v1", model: "m" }),
+				);
+				const reply = await client.nextMessage();
+				assert.equal(reply.kind, "provider-test-result");
+				assert.equal(reply.providerTestId, providerTestId);
+				assert.equal(reply.ok, expectedOk);
+			}
+			client.send(JSON.stringify({ type: "provider-test", providerTestId: "probe-invalid", model: "m" }));
+			const invalid = await client.nextMessage();
+			assert.equal(invalid.kind, "error");
+			assert.equal(invalid.providerTestId, "probe-invalid");
+			assert.equal(invalid.code, "bad-request");
+			for (const providerTestId of ["", "x".repeat(129), 123]) {
+				client.send(
+					JSON.stringify({ type: "provider-test", providerTestId, baseUrl: "https://probe.example/v1", model: "m" }),
+				);
+				const rejected = await client.nextMessage();
+				assert.equal(rejected.kind, "error");
+				assert.equal(rejected.code, "bad-request");
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+			client.close();
+		}
+	});
+
 	it("provider-test selects the requested model's baseUrl override instead of the sorted first model", async () => {
 		const modelsPath = join(tempDir("pi-mgw-provider-override-"), "models.json");
 		writeFileSync(
@@ -2222,7 +2264,21 @@ describe("router: provider management (models.json)", () => {
 		const calls: string[] = [];
 		globalThis.fetch = (async (url) => {
 			calls.push(String(url));
-			return new Response('{"data":[{"id":"listed"}]}', { status: 200 });
+			return new Response(
+				JSON.stringify(
+					String(url).includes("/chat/completions")
+						? { choices: [{ message: { content: "pong" } }] }
+						: String(url).endsWith("/messages")
+							? { type: "message", content: [{ type: "text", text: "pong" }] }
+							: String(url).endsWith("/responses")
+								? {
+										status: "completed",
+										output: [{ type: "message", content: [{ type: "output_text", text: "pong" }] }],
+									}
+								: { data: [{ id: "listed" }] },
+				),
+				{ status: 200 },
+			);
 		}) as typeof fetch;
 		try {
 			// The draft common URL must not replace the selected model override.
@@ -2471,7 +2527,8 @@ describe("router: provider management (models.json)", () => {
 			const result = (await client.nextMessage()) as Record<string, unknown>;
 			assert.equal(result.kind, "provider-test-result");
 			assert.equal(result.ok, false);
-			assert.match(String(result.error), /网页而不是 API 响应/);
+			assert.equal(result.code, "html-response");
+			assert.equal(result.error, "地址返回了网页");
 
 			// 测试失败仍保留 Pi 模型；providers 帧只更新诊断状态。
 			client.send(JSON.stringify({ type: "models" }));

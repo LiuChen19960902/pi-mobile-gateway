@@ -963,10 +963,19 @@ export function connectClient(
 				case "provider-test": {
 					// 用表单当前值测试；编辑场景缺失的字段回退到 models.json 里已存的值
 					// （手机凭证盲，不要求用户重填 apiKey）。
+					const providerTestId = asString(frame, "providerTestId");
+					if (Object.hasOwn(frame, "providerTestId") && (!providerTestId || providerTestId.length > 128)) {
+						send(errorFrame("bad-request", "invalid providerTestId", "provider-test"));
+						return;
+					}
+					const correlation = providerTestId ? { providerTestId } : {};
 					try {
 						const { id, baseUrl, apiKey, api, modelId } = await resolveProviderFormFields(frame);
 						if (!baseUrl || !modelId) {
-							send(errorFrame("bad-request", "provider-test requires baseUrl and a model", "provider-test"));
+							send({
+								...errorFrame("bad-request", "provider-test requires baseUrl and a model", "provider-test"),
+								...correlation,
+							});
 							return;
 						}
 						const result = await testProvider({ baseUrl, apiKey, api, modelId });
@@ -985,7 +994,7 @@ export function connectClient(
 							currentApi === (api ?? "openai-completions") &&
 							current?.apiKey === apiKey;
 						// 结果落盘：
-						//  - 成功 / config 失败（需用户改配置）→ 写入（决定灰显与菜单可见性）
+						//  - 成功 / config 失败（需用户改配置）→ 写入诊断（不控制 Pi 模型菜单）
 						//  - transient 失败（超时/5xx/429）→ 保留旧成功；只清除旧失败，
 						//    避免配置已修正但上游抖动仍沿用过期的config-fail禁用。
 						if (id && testsSavedConfig) {
@@ -1000,9 +1009,9 @@ export function connectClient(
 								});
 							}
 						}
-						send({ kind: "provider-test-result", id: id ?? null, ...result });
+						send({ kind: "provider-test-result", id: id ?? null, ...result, ...correlation });
 					} catch (error) {
-						send(providerErrorFrame(error, "provider-test"));
+						send({ ...providerErrorFrame(error, "provider-test"), ...correlation });
 					}
 					return;
 				}

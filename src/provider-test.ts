@@ -1,20 +1,5 @@
-// provider 连接测试与健康状态。
-//
-// 目的：手机端把 provider 写进 models.json 后，用户在此之前无从知道配置对不对
-// ——baseUrl 少一段路径（如 `/v1`）时上游会把首页 HTML 当成成功响应返回，pi 直到
-// 真正对话才报 “Stream ended without finish_reason”，用户完全看不出原因。
-//
-// 两条铁律：
-//   1. **复刻 pi 的请求方式**，否则测试结果不代表 pi 能否工作。pi 的
-//      `openai-completions` 走 OpenAI SDK，URL 为 `new URL(baseURL + "/chat/completions")`
-//      （SDK 仅在 baseURL 以 `/` 结尾时去掉 path 首斜杠），因此 baseUrl 必须自带
-//      `/v1` 之类路径段。这里逐字对齐该拼接。
-//   2. **只做只读探测**：发一条最小对话请求（`TEST_MAX_TOKENS` 条输出），不流式、
-//      不跟随重定向、有超时与响应体上限。
-//
-// 测试结果持久化在网关自己的文件（不动 models.json，也不影响 pi/TUI）：只有
-// 「测过且失败」才算未激活；没有记录的 provider（例如用户在电脑上手工添加的）
-// 一律视为激活，避免把既有配置隐藏掉。
+// Provider 最小生成探针：按协议验证实际模型响应，不认证完整聊天能力。
+// 测试不写模型配置；诊断只保留短文案与稳定码，避免上游错误泄露地址和凭据。
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -27,11 +12,13 @@ export type ProviderFailureKind = "config" | "transient";
 
 /** 单次测试的结论。`error` 是可直接展示给用户的中文说明。 */
 export interface ProviderTestResult {
+	/** 稳定诊断码；旧客户端可继续读取短 error。 */
+	code?: string;
 	ok: boolean;
 	latencyMs: number;
 	/** 上游 HTTP 状态码（网络层失败时缺省）。 */
 	httpStatus?: number;
-	/** 实际请求的 URL，失败时回显给用户定位配置问题。 */
+	/** 旧响应的兼容字段；当前探针不回显地址。 */
 	url?: string;
 	error?: string;
 	/** 失败归因；`ok:true` 时缺省。 */
@@ -59,7 +46,6 @@ export function joinProviderUrl(baseUrl: string, path: string): string {
 	return new URL(joined).toString();
 }
 
-/** 不把所有协议的404都误导成“少了/v1”。不修改配置或请求路径。 */
 function endpointHint(baseUrl: string, api: string | undefined): string {
 	if (api === "anthropic-messages") {
 		return /\/v1\/?$/.test(baseUrl)
@@ -97,7 +83,7 @@ function testRequest(input: ProviderTestInput): { url: string; headers: Record<s
 		return {
 			url: joinProviderUrl(input.baseUrl, `/models/${encodeURIComponent(input.modelId)}:generateContent`),
 			headers: { "content-type": "application/json", "x-goog-api-key": key },
-			body: { contents: [{ parts: [{ text: "ping" }] }] },
+			body: { contents: [{ parts: [{ text: "ping" }] }], generationConfig: { maxOutputTokens: TEST_MAX_TOKENS } },
 		};
 	}
 	if (api === "openai-responses") {
@@ -114,37 +100,12 @@ function testRequest(input: ProviderTestInput): { url: string; headers: Record<s
 			},
 		};
 	}
-	// openai-completions 及未知协议：按 OpenAI 兼容端点测试。
+	// 调用方已校验协议；这里只处理 openai-completions。
 	return {
 		url: joinProviderUrl(input.baseUrl, "/chat/completions"),
 		headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
 		body: { model: input.modelId, max_tokens: TEST_MAX_TOKENS, messages: [{ role: "user", content: "ping" }] },
 	};
-}
-
-/** 判定“响应像不像 API 应答”，并直接从 body 里判定“是不是错误响应”。
- *  HTML/纯文本要单独给提示——这正是 baseUrl 少路径段时的典型症状（中转站把首页
- *  200 返回给任意路径）；`error` 键存在即视为失败（兼容 `{"error":"str"}` 与
- *  `{"error":{"code":500}}` 这类无 message 的形态）。 */
-function describeBody(body: string): { kind: "json" | "html" | "text"; error?: string } {
-	const trimmed = body.trim();
-	if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-		try {
-			const parsed: unknown = JSON.parse(trimmed);
-			if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-				const record = parsed as Record<string, unknown>;
-				if ("error" in record && record.error !== null && record.error !== undefined) {
-					return { kind: "json", error: extractUpstreamMessage(trimmed) ?? "上游返回 error 响应" };
-				}
-				return { kind: "json" };
-			}
-			if (Array.isArray(parsed)) return { kind: "json" };
-		} catch {
-			return { kind: "text", error: "响应不是合法 JSON" };
-		}
-	}
-	if (/^\s*<(!doctype|html|\?xml)/i.test(trimmed)) return { kind: "html" };
-	return { kind: "text" };
 }
 
 /** 读取响应体到上限（流式 + 主动 cancel）：`response.text()` 会把整个 body 读进
@@ -197,115 +158,166 @@ function extractUpstreamMessage(body: string): string | undefined {
 	return undefined;
 }
 
-/**
- * 用已存/表单提供的凭据探测一个 provider。永不抛错——所有失败都折算成
- * `{ ok:false, error }`，因为调用方要把结论回给手机端展示。
- */
+const TEST_ERRORS: Record<string, string> = {
+	"invalid-url": "地址格式不正确",
+	"missing-model": "请填写模型 ID",
+	"unsupported-api": "当前协议不支持连接测试",
+	"auth-rejected": "认证被拒",
+	"access-denied": "请求被拒",
+	"not-found": "接口或模型不存在",
+	"payment-required": "上游要求付费",
+	"rate-limited": "请求受限",
+	"upstream-error": "上游服务异常",
+	"request-rejected": "上游拒绝请求",
+	"model-unavailable": "模型不存在或无访问权限",
+	"insufficient-quota": "上游额度不足",
+	redirect: "地址发生重定向",
+	"html-response": "地址返回了网页",
+	"invalid-response": "未收到有效模型响应",
+	timeout: "请求超时",
+	"dns-failed": "无法解析服务地址",
+	"tls-failed": "安全连接失败",
+	"connection-refused": "服务拒绝连接",
+	"network-error": "网络连接失败",
+};
+
+function object(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function hasText(value: unknown): boolean {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+/** 只认各协议的模型输出形态；不能用“有 JSON”代替实际模型应答。 */
+function hasModelResponse(body: unknown, api: string): boolean {
+	const value = object(body);
+	if (!value) return false;
+	if (api === "anthropic-messages") {
+		return (
+			value.type === "message" &&
+			Array.isArray(value.content) &&
+			value.content.some((part: unknown) => {
+				const item = object(part);
+				return (item?.type === "text" && hasText(item.text)) || (item?.type === "thinking" && hasText(item.thinking));
+			})
+		);
+	}
+	if (api === "google-generative-ai") {
+		return (
+			Array.isArray(value.candidates) &&
+			value.candidates.some((candidate: unknown) => {
+				const parts = object(object(candidate)?.content)?.parts;
+				return Array.isArray(parts) && parts.some((part: unknown) => hasText(object(part)?.text));
+			})
+		);
+	}
+	if (api === "openai-responses") {
+		return (
+			value.status !== "failed" &&
+			Array.isArray(value.output) &&
+			value.output.some((part: unknown) => {
+				const item = object(part);
+				const content = item?.type === "message" ? item.content : item?.type === "reasoning" ? item.summary : undefined;
+				return Array.isArray(content) && content.some((chunk: unknown) => hasText(object(chunk)?.text));
+			})
+		);
+	}
+	return (
+		Array.isArray(value.choices) &&
+		value.choices.some((choice: unknown) => {
+			const message = object(object(choice)?.message);
+			return hasText(message?.content) || hasText(message?.reasoning_content) || hasText(message?.reasoning);
+		})
+	);
+}
+
+function httpFailureCode(status: number, body: unknown): string {
+	if (status === 401) return "auth-rejected";
+	if (status === 403) return "access-denied";
+	const error = object(object(body)?.error);
+	const upstreamCode = error?.code ?? error?.type;
+	// 只采用确定的结构化错误码；不将上游 message 或任意字符串回显。
+	if (upstreamCode === "model_not_found") return "model-unavailable";
+	if (upstreamCode === "insufficient_quota") return "insufficient-quota";
+	if (status === 404) return "not-found";
+	if (status === 402) return "payment-required";
+	if (status === 429) return "rate-limited";
+	if (status >= 500) return "upstream-error";
+	return "request-rejected";
+}
+
+function networkFailureCode(error: unknown): string {
+	const item = object(error);
+	const cause = object(item?.cause);
+	const code = item?.code ?? cause?.code;
+	if (
+		item?.name === "TimeoutError" ||
+		item?.name === "AbortError" ||
+		code === "ETIMEDOUT" ||
+		code === "UND_ERR_CONNECT_TIMEOUT"
+	)
+		return "timeout";
+	if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "dns-failed";
+	if (code === "ECONNREFUSED") return "connection-refused";
+	if (typeof code === "string" && /CERT|^ERR_TLS|^DEPTH_ZERO|^UNABLE_TO_VERIFY/.test(code)) return "tls-failed";
+	return "network-error";
+}
+
 export async function testProvider(input: ProviderTestInput): Promise<ProviderTestResult> {
 	const startedAt = Date.now();
-	const latency = () => Date.now() - startedAt;
-	if (!/^https?:\/\//.test(input.baseUrl)) {
-		return { ok: false, latencyMs: 0, error: "Base URL 必须是 http(s) 地址" };
-	}
-	if (input.modelId.trim() === "") {
-		return { ok: false, latencyMs: 0, error: "需要至少一个模型 id 才能测试连接" };
-	}
+	const failure = (code: string, httpStatus?: number, transient = false): ProviderTestResult => ({
+		ok: false,
+		code,
+		error: TEST_ERRORS[code],
+		latencyMs: Date.now() - startedAt,
+		...(httpStatus === undefined ? {} : { httpStatus }),
+		failureKind: transient ? "transient" : "config",
+	});
+	if (!/^https?:\/\//.test(input.baseUrl)) return failure("invalid-url");
+	if (!input.modelId.trim()) return failure("missing-model");
+	const api = input.api ?? "openai-completions";
+	if (!["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"].includes(api))
+		return failure("unsupported-api");
 	let request: ReturnType<typeof testRequest>;
 	try {
 		request = testRequest(input);
 	} catch {
-		return { ok: false, latencyMs: latency(), error: "Base URL 不是合法地址" };
+		return failure("invalid-url");
 	}
-
+	const signal = AbortSignal.timeout(TEST_TIMEOUT_MS);
 	try {
 		const response = await fetch(request.url, {
 			method: "POST",
 			headers: request.headers,
 			body: JSON.stringify(request.body),
-			// 探测不应被重定向到别处（中转常见 302 到登录页）。
 			redirect: "manual",
-			signal: AbortSignal.timeout(TEST_TIMEOUT_MS),
+			signal,
 		});
-		const text = await readBodyCapped(response, MAX_BODY_BYTES);
 		const status = response.status;
-
 		if (status >= 300 && status < 400) {
-			return {
-				ok: false,
-				failureKind: "config",
-				latencyMs: latency(),
-				httpStatus: status,
-				url: request.url,
-				error: `上游返回重定向（HTTP ${status}）→ ${response.headers.get("location") ?? "未知地址"}，请确认 baseUrl 是否少了路径段`,
-			};
+			await response.body?.cancel();
+			return failure("redirect", status);
 		}
-		const shape = describeBody(text);
-		if (!response.ok) {
-			const upstream = extractUpstreamMessage(text);
-			// 5xx / 429 是上游自身问题（含限流、过载）：不得因此禁用 provider。
-			const transient = status >= 500 || status === 429;
-			const hint =
-				status === 401 || status === 403
-					? "认证失败，请检查 API Key"
-					: status === 404
-						? `端点不存在（${request.url}），${endpointHint(input.baseUrl, input.api)}`
-						: transient
-							? "上游暂时不可用（稍后重试即可，配置本身可能没问题）"
-							: "上游返回错误";
-			return {
-				ok: false,
-				failureKind: transient ? "transient" : "config",
-				latencyMs: latency(),
-				httpStatus: status,
-				url: request.url,
-				error: `${hint}${upstream ? `：${upstream}` : `（HTTP ${status}）`}`,
-			};
+		const text = await readBodyCapped(response, MAX_BODY_BYTES);
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch {
+			parsed = undefined;
 		}
-		if (shape.error) {
-			return {
-				ok: false,
-				failureKind: "config",
-				latencyMs: latency(),
-				httpStatus: status,
-				url: request.url,
-				error: shape.error,
-			};
-		}
-		if (shape.kind !== "json") {
-			return {
-				ok: false,
-				failureKind: "config",
-				latencyMs: latency(),
-				httpStatus: status,
-				url: request.url,
-				error:
-					shape.kind === "html"
-						? `该地址返回的是网页而不是 API 响应（${request.url}）——常见原因是 baseUrl 少了 /v1 等路径段，或填成了站点首页`
-						: `该地址返回的不是 JSON API 响应（${request.url}），请检查 baseUrl`,
-			};
-		}
-		// 错误响应已在 describeBody 里按 `error` 键统一判定（含 `{"error":"str"}`
-		// 与无 message 的错误体），这里不再做子串猜测：否则带顶层 `message` 字段的
-		// 正常响应会被误判为失败。
-		return { ok: true, latencyMs: latency(), httpStatus: status, url: request.url };
+		if (!response.ok) return failure(httpFailureCode(status, parsed), status, status === 429 || status >= 500);
+		if (object(parsed)?.error != null) return failure(httpFailureCode(status, parsed), status);
+		if (/^\s*<(!doctype|html|\?xml)/i.test(text)) return failure("html-response", status);
+		if (!hasModelResponse(parsed, api)) return failure("invalid-response", status);
+		return { ok: true, latencyMs: Date.now() - startedAt, httpStatus: status };
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		const timedOut = /abort|timeout/i.test(message);
-		return {
-			ok: false,
-			// 已通过地址与参数校验；请求/读响应阶段的连接中断与超时都不能
-			// 证明配置错误。与模型拉取一致，避免一次网络波动禁用 provider。
-			failureKind: "transient",
-			latencyMs: latency(),
-			url: request.url,
-			error: timedOut
-				? `连接超时（${TEST_TIMEOUT_MS / 1000}s，上游较慢时可稍后重试，不代表配置错误）：${message}`
-				: `无法连接到该地址：${message}`,
-		};
+		return failure(signal.aborted ? "timeout" : networkFailureCode(error), undefined, true);
 	}
 }
 
-/** 持久化的单条测试结论。 */
 export interface ProviderModelsInput {
 	baseUrl: string;
 	apiKey?: string;
