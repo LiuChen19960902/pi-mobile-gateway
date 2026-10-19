@@ -4,6 +4,7 @@
 
 ### Added
 
+- `extension-status` 帧与同名能力：通过 Pi 公开扩展 API `ctx.ui.setStatus` 发布会话级状态行（子 agent 运行、后台任务等），`subscribed` / `session-restarted` 携带快照，实时变化以完整快照推送；网关只桥接这一显示原语，其余扩展 UI 方法保持 no-op。状态是显示提示，不定义任务终态，也不参与会话保活。
 - `attachment` 帧：按 `sessionId + entryId + imageIndex` 从 pi 会话条目按需取回历史图片（活动会话优先、回落文件视图；单图原始 ≤4 MiB；错误以关联三元组回显）；`hello.capabilities` 增加 `attachment`。
 - 事件帧新增顶层 `entryId`（pi 条目身份）：在 pi emit→append 微任务窗口后按对象引用匹配 `SessionManager.getEntries()` 得出，history 平行 `entryIds` 对应；客户端据此做实时/历史消息身份合并。
 - `history` 未落盘窗口恢复：①会话尚无 assistant（首轮未落盘）②流式中 emit→append 间隙——当文件视图是 live 条目前缀时，把 live 尾部条目并入 history 并按 live 叶子切换活跃链；`latestEntryId` 并入时取 live 叶子。外部重写文件不满足前缀时不合并（不复活陈旧条目）。

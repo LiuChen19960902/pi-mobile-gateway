@@ -244,6 +244,8 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 								"worktree-status",
 								"worktree-trust",
 								"attachment",
+								// 扩展通过 Pi 公开 ctx.ui.setStatus 发布的状态行（PROTOCOL §4.29）。
+								"extension-status",
 							]
 						: ["ping", "ping-id"]) satisfies (
 						| ClientFrameType
@@ -257,6 +259,7 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 						| "provider-test-id-v1"
 						| "prompt-disposition-v1"
 						| "ping-id"
+						| "extension-status"
 					)[],
 				},
 				log,

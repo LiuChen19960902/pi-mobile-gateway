@@ -52,6 +52,7 @@
 | `["…","tree","switch-branch"]` | 会话分支树与分支切换 |
 | `["…","entry-copy","label-put"]` | 树动作：整条 entry 可复制全文（Pi Ctrl+X）/ 标签写（Pi Shift+L）；同时宣告特性名 `tree-actions-v1` |
 | `["…","attachment"]` | 历史图片按需取回（按 `sessionId+entryId+imageIndex`，单图 4 MiB） |
+| `["…","extension-status"]` | 扩展通过 Pi 公开 `ctx.ui.setStatus` 发布的状态行（§4.29）；只桥接这一个显示原语 |
 
 上表按阶段累积描述，**数组顺序不属于契约**：客户端只做成员检测（`kind in capabilities`）。
 
@@ -177,13 +178,14 @@
 ### 4.3 `subscribe` / `unsubscribe` — 事件流订阅
 
 ```json
-{"type":"subscribe","sessionId":"<uuid>"}    → {"kind":"subscribed","sessionId":"…"}
+{"type":"subscribe","sessionId":"<uuid>"}    → {"kind":"subscribed","sessionId":"…","statuses":[…]?}
 {"type":"unsubscribe","sessionId":"<uuid>"}  → {"kind":"unsubscribed","sessionId":"…"}
 ```
 
 - `subscribe` 会按需把会话加载进网关内存（幂等；已加载则复用）；
 - 订阅按连接隔离：断线自动退订；多设备可同时订阅同一会话，收到的 `seq` 一致；
-- `unsubscribe` 幂等（未订阅也返回 `unsubscribed`）。
+- `unsubscribe` 幂等（未订阅也返回 `unsubscribed`）；
+- 宣告 `extension-status` 时，`subscribed` 可带当前扩展状态快照 `statuses`（§4.29）；未宣告的旧网关没有该字段，客户端按空处理。
 
 ### 4.4 `event` — 会话事件推送（服务端主动）
 
@@ -734,6 +736,21 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 
 首页选择只设置新会话目录；会话内“新建会话”回首页，首条消息才创建；会话内“继续”才调用继续端点。客户端在权威成功后同时更新订阅、历史、目录与草稿归属，失败或未知不清源草稿。旧网关的其他功能保持原协议。
 
+### 4.29 `extension-status` — 扩展状态行（服务端主动）
+
+```json
+{"kind":"extension-status","sessionId":"<uuid>","statuses":[
+  {"key":"subagents","text":"1 agent running"}
+]}
+```
+
+- 来源是 Pi 公开扩展 API `ctx.ui.setStatus(key, text)`（RPC 模式的官方 `extension_ui_request`/`setStatus` 语义）。网关只桥接这一种显示原语；`setWidget`、`notify`、对话框等在网关内保持 no-op，避免在没有完整 UI 协议时让扩展等待。
+- 帧是**该会话的完整快照**：每次有实际变化后重发全部 `statuses`，空数组表示清除所有状态行，不做增量合并。网关合并同一 tick 的多次 `setStatus`，按 `key` 排序；相同 key 相同文本不重发。
+- 文本护栏：去掉 ANSI 转义、把换行/制表符折成空格、trim 后截断到 200 字符；`key` trim 后最多 64 字符，超长 key 的设置和清除均忽略，不截断或改写身份；最多 16 行。空 key 忽略，空文本等价于清除该 key。
+- 初始化：`subscribe` 应答的 `subscribed.statuses`（§4.3）与 `restart-session` 的 `session-restarted.statuses` 携带当前快照。重建会话时，扩展可能在初始化（`session_start`）期间就发布状态，此时还没有订阅者；网关在迁移完订阅者后**无条件补发一份完整快照**（空状态也发，用于清掉旧状态行）。`extension-status` 帧本身不需要请求，也不占用 `event.seq`。同一会话有多条连接时，补发的快照可能先于发起连接收到的 `session-restarted` 到达；客户端以最后一份完整快照为准，重复快照幂等。
+- **语义边界**：状态是显示提示，不是任务契约。它不证明后台任务已结束，也不能用于会话保活/回收判定；扩展崩溃或忘记清除时状态可能残留。没有状态帧不代表任务一定结束；客户端不要把空快照解释为“任务完成”。
+- 能力：`extension-status`。旧客户端收到未知 `kind` 时按未知帧忽略；旧网关不发该帧、`subscribed` 也无 `statuses`。
+
 ## 5. 管理面（localhost HTTP，不面向移动端）
 
 | 方法与路径 | 说明 |
@@ -771,3 +788,9 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 - `tree-actions-v1`：树页动作接线，宣告请求 `entry-copy`（§4.26）/ `label-put`（§4.27）。两端点对应 Pi TUI 树选择器的 Ctrl+X 与 Shift+L，只覆盖这两个操作：不扩展时间快捷键、消息编辑/删除、筛选循环或其他维护命令。
 - 客户端只在发现 `tree-actions-v1` 后才发送这两类请求；旧网关上动作卡只显示“跳到此处”，复制/标签入口隐藏并提示升级网关。发布新 APK 不代表网关服务已更新。
 - `tree` / `switch-branch` / `tree-view-v1` 的既有语义不变；标签写会推进叶子这一点由 §4.27 明确，客户端不得把新 `LabelEntry` 当可见行或跳转目标。
+
+### extension-status 兼容扩展（2026-10-19）
+
+- `extension-status`：桥接 Pi 公开 `ctx.ui.setStatus` 的会话级状态行（§4.29）。宣告后 `subscribed.statuses` 与 `session-restarted.statuses` 携带快照，实时变化以 `extension-status` 帧推送。
+- 客户端只在发现该能力后渲染状态；旧网关无此能力时不显示空占位。该能力不定义任务终态，不能代替 `agent_settled`、`tool_execution_end` 或插件自己的任务结果。
+- 文本是纯显示内容（已去 ANSI），不承诺可解析结构；需要结构化的后台任务状态仍走未来的独立能力。

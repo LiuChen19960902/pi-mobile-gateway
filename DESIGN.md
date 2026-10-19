@@ -35,6 +35,7 @@ dsh 的网关做成插件，是因为 `dsh web` 本身常驻 Web 服务器，插
 | `src/pi-runtime.ts` | 会话运行时：共享 ModelRuntime、sessionId→路径索引（listAll + TTL 缓存）、活动句柄注册表（事件 seq/订阅 sink/prompt 受理串行化/空闲回收）、活动分支历史分页（首 assistant 落盘前与流式中的旧会话均补入 live 尾部条目，前缀不成立时视为陈旧不并入） |
 | `src/router.ts` | 业务帧分发：每连接订阅表、参数校验、`sent`/`history`/`state`/`subscribed` 等应答与统一 error 帧 |
 | `src/input-assist.ts` | Skills/Prompt 会话清单及不安装包的本地预览；复用 Pi TUI 公开 @ 补全，每连接取消旧 fd、超时及响应归属 |
+| `src/extension-status.ts` | 扩展 UI 只读桥：`ctx.ui.setStatus` → 会话级状态行（去 ANSI、长度/行数护栏），其余 UI 方法 no-op |
 | `src/mgmt.ts` | 管理面：localhost-only JSON API（Host/Origin/Content-Type 防护） |
 | `src/main.ts` | CLI 入口、局域网 IP 推断、终端二维码、`--session-dir` 会话目录覆盖 |
 
@@ -105,10 +106,13 @@ dsh 的网关做成插件，是因为 `dsh web` 本身常驻 Web 服务器，插
 - `dispose()` 走 SDK `dispose()`；网关进程退出时全部释放；
 - 列表索引走 `SessionManager.listAll()` + 15s TTL；并发扫描共享同一失效代的promise，旧代结果不能回写新索引。打开已知会话可复用经文件存在和头ID核实的路径，正文仍按文件stat刷新，路径删除/身份变化重查；新建会话即失效。`sessionDir`覆盖贯穿create/open/listAll，测试用临时目录隔离。
 
-### 决策五：扩展绑定 = `bindExtensions({mode:"rpc"})`，无 uiContext
+### 决策五：扩展绑定 = `bindExtensions({mode:"rpc"})` + 只读 uiContext（仅状态行）
 
-- 与 pi 自家 RPC 模式同款调用；runner 对缺失 uiContext 有内置 `noOpUIContext` 兜底（对话框自动取消，不挂起），扩展加载失败仅记录不致命；
-- 扩展 UI 请求尚未接入手机；新增交互需要单独设计请求、应答与取消流程，不能由普通工具事件推断。
+- 与 pi 自家 RPC 模式同款绑定；网关传入自己的 `uiContext`，但只实现 Pi 公开的 `ctx.ui.setStatus(key, text)`，映射为会话级 `extension-status` 快照帧（PROTOCOL §4.29）。`setWidget`/`notify`/对话框等其余方法保持 no-op（对话框立即返回取消），避免没有完整 UI 协议时让扩展等待；
+- 动机：桌面 TUI 的子 agent、压缩、后台任务等扩展会通过 `setStatus` 发布“正在运行”的状态行；桥接这个公开原语后，手机无需逐个适配扩展包，任何遵循 Pi 扩展 UI 契约的实现都能显示状态。pi-subagents 等扩展在 RPC 模式补发 `setStatus` 即可；
+- 边界：状态是显示提示，不证明任务终态、不参与会话保活/回收，也不能替代结构化后台任务协议；完整对话框/通知/widget 交互仍需要单独设计请求、应答与取消流程，不能由普通工具事件推断；
+- 生命周期：`uiContext` 与 SDK 句柄同生共死；`subscribe`/`restart-session` 应答携带快照，`session.dispose()` 时随句柄丢弃。扩展加载/绑定失败仅记录，不致命；
+- 初始化与重载：句柄登记后仍有 `ready` 门禁，扩展绑定完成前 `openSession`/`state`/`prompt` 等入口等待，sweeper 与容量淘汰跳过初始化中的句柄；同会话 `restart-session` 串行执行，迁移订阅者后无条件广播一份完整状态快照（新扩展可能在 `session_start` 就发布状态）。
 
 ### 决策六：并发构建去重
 
