@@ -228,6 +228,7 @@ writeFixtureSession(sessionsDir, fixtureCwd);
 const registry = createRegistry(join(deviceDir, "devices.json"));
 const sessions = new Map<string, ScriptedSession>();
 const runtime = new PiRuntime({
+	agentDir: join(fixtureHome, ".pi", "agent"),
 	sessionDir: sessionsDir,
 	sessionFactory: async ({ sessionManager }) => {
 		const session = new ScriptedSession(sessionManager);

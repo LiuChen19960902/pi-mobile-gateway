@@ -237,12 +237,19 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 								"provider-catalog-v1",
 								"ping-id",
 								"switch-branch",
+								"worktree-v1",
+								"worktree-list",
+								"worktree-create",
+								"worktree-continue",
+								"worktree-status",
+								"worktree-trust",
 								"attachment",
 							]
 						: ["ping", "ping-id"]) satisfies (
 						| ClientFrameType
 						| "tree-view-v1"
 						| "tree-actions-v1"
+						| "worktree-v1"
 						| "history-turns-v1"
 						| "provider-catalog-v1"
 						| "model-scope-v1"

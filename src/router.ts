@@ -1,6 +1,7 @@
 import { HistoryCursorError, HistoryTurnPageTooLargeError } from "./history-turns.ts";
 import { createInputAssist } from "./input-assist.ts";
 import { LABEL_MAX_CHARS, normalizeLabelValue, readTreeView } from "./tree-view.ts";
+import { WorktreeError } from "./worktrees.ts";
 // Business-frame router: one instance per authenticated client connection.
 //
 // The transport plane (server.ts) hands every post-handshake JSON frame here
@@ -291,6 +292,67 @@ export function connectClient(
 				case "input-completions":
 					await inputAssist.handle(frame);
 					return;
+				case "worktree-list": {
+					const queryId = asString(frame, "queryId");
+					const cwd = asString(frame, "cwd");
+					const sessionId = asString(frame, "sessionId");
+					if (!queryId || queryId.length > 128 || !!cwd === !!sessionId)
+						throw new WorktreeError("worktree-path-invalid");
+					send({
+						kind: "worktree-list",
+						queryId,
+						...(sessionId ? { sessionId } : {}),
+						...(await runtime.worktreeList(cwd, sessionId)),
+					});
+					return;
+				}
+				case "worktree-create": {
+					const operationId = asString(frame, "operationId");
+					const cwd = asString(frame, "cwd");
+					const branch = asString(frame, "branch");
+					const base = asString(frame, "base");
+					const targetPath = asString(frame, "targetPath");
+					if (!operationId || !cwd || !branch || !base || !targetPath) throw new WorktreeError("worktree-path-invalid");
+					send({
+						kind: "worktree-operation",
+						...(await runtime.worktreeCreate(operationId, cwd, branch, base, targetPath)),
+					});
+					return;
+				}
+				case "worktree-continue": {
+					const operationId = asString(frame, "operationId");
+					const sessionId = asString(frame, "sessionId");
+					const targetPath = asString(frame, "targetPath");
+					if (!operationId || !sessionId || !targetPath) throw new WorktreeError("worktree-path-invalid");
+					send({
+						kind: "worktree-operation",
+						...(await runtime.continueWorkspace(
+							operationId,
+							sessionId,
+							targetPath,
+							frame.trustProject === true,
+							frame.retry === true,
+						)),
+					});
+					return;
+				}
+				case "worktree-trust": {
+					const operationId = asString(frame, "operationId");
+					const targetPath = asString(frame, "targetPath");
+					if (!operationId || operationId.length > 128 || !targetPath) throw new WorktreeError("worktree-path-invalid");
+					send({
+						kind: "worktree-trust",
+						operationId,
+						cwd: runtime.worktreeTrust(targetPath, frame.trustProject === true),
+					});
+					return;
+				}
+				case "worktree-status": {
+					const operationId = asString(frame, "operationId");
+					if (!operationId) throw new WorktreeError("worktree-operation-invalid");
+					send({ kind: "worktree-operation", ...(await runtime.worktreeStatus(operationId)) });
+					return;
+				}
 				case "sessions": {
 					const items = await runtime.listSessions();
 					send({ kind: "sessions", items });
@@ -676,6 +738,10 @@ export function connectClient(
 						const result = await runtime.putLabel(sessionId, entryId, normalized.label);
 						send({ kind: "label-put", ...result });
 					} catch (error) {
+						if (error instanceof WorktreeError) {
+							send(treeActionError(error.code, "正在切换工作区，请稍后重试", "label-put", sessionId, entryId));
+							return;
+						}
 						if (error instanceof SessionNotFoundError) {
 							send(treeActionError("session-not-found", error.message, "label-put", sessionId, entryId));
 						} else if (error instanceof EntryNotFoundError) {
@@ -1106,6 +1172,14 @@ export function connectClient(
 			}
 			if (error instanceof HistoryTurnPageTooLargeError) {
 				send(errorFrame("history-turn-too-large", error.message, requestType, asString(frame, "sessionId")));
+				return;
+			}
+			if (error instanceof WorktreeError) {
+				send({
+					...errorFrame(error.code, "工作区操作未完成", requestType, asString(frame, "sessionId")),
+					...(asString(frame, "queryId") ? { queryId: asString(frame, "queryId") } : {}),
+					...(asString(frame, "operationId") ? { operationId: asString(frame, "operationId") } : {}),
+				});
 				return;
 			}
 			if (error instanceof SessionNotFoundError) {

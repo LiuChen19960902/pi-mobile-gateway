@@ -541,6 +541,7 @@ describe("hello capabilities advertisement", () => {
 				...CLIENT_FRAME_TYPES,
 				"tree-view-v1",
 				"tree-actions-v1",
+				"worktree-v1",
 				"history-turns-v1",
 				"provider-catalog-v1",
 				"ping-id",
