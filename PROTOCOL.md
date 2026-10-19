@@ -720,6 +720,20 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 - 错误：`sessionId`/`entryId` 缺失或超过 256 字符、`label` 非法 → `bad-request`；未知会话或无活动句柄 → `session-not-found`；目标 entry 不在该会话 → `entry-not-found`。错误帧在参数齐备时回显 `sessionId`+`entryId`（缺参帧只带 `requestType`）。
 - 能力宣告：`tree-actions-v1`（同时含 `entry-copy`/`label-put` 两个帧类型）。旧网关不宣告时客户端隐藏复制/标签入口，只保留浏览选中与跳转。
 
+### 4.28 worktree-v1（工作区）
+
+能力 `worktree-v1` 同时宣告 `worktree-list`、`worktree-create`、`worktree-continue`、`worktree-status`、`worktree-trust`。客户端仅在显式宣告时显示入口。
+
+- `worktree-list {queryId,cwd? ,sessionId?}`：两种位置互斥；会话位置由网关读取真实 cwd。回 `{kind:"worktree-list",queryId,sessionId?,cwd,repoRoot,branch,suggestDir,dirty,worktrees:[{path,branch,commit,main,missing}]}`。非 Git 返回 `repoRoot:null` 与空列表，继续普通目录交互。每次打开及手动刷新重扫，不轮询。
+- `worktree-create {operationId,cwd,branch,base,targetPath}`：基点先解析为提交，使用 Git 参数数组创建新分支与 worktree，不执行 shell、不提交/stash/复制未提交文件。默认基点 `HEAD`，默认目录为仓库父目录的 `.worktrees/<仓库名>/<分支名slug>`，最终路径提交前可编辑。 仓库没有任何可达提交时返回 `worktree-no-commits`；不自动创建初始提交。
+- `worktree-trust {operationId,targetPath,trustProject?}`：检查目标项目资源的 Pi 信任记录；未信任返回 `worktree-trust-required`。手机明确确认后传 `trustProject:true`，通过公开 `ProjectTrustStore` 只信任该规范路径，返回 `{kind:"worktree-trust",operationId,cwd}`。首页选目标和在目标新建会话也先检查。
+- `worktree-continue {operationId,sessionId,targetPath,trustProject?,retry?}`：源会话必须空闲、无压缩和待发队列；目标可为 worktree 根或普通目录。通过 Pi 公开会话 API 保留完整树、当前活动分支和模型/思考，在目标目录建立独立运行器；源会话保持可用。失败不切客户端会话，不隐式终止任务，不更改首页目标。
+- 两种写操作回 `{kind:"worktree-operation",operationId,action:"create"|"continue",status:"pending"|"succeeded"|"failed"|"unknown",sessionId?,targetSessionId?,cwd?,code?,worktree?}`；`sessionId` 为源会话，成功继续的目标 ID 为 `targetSessionId`。创建与继续是两次独立操作，创建成功后继续失败时不能再次创建。
+- `worktree-status {operationId}` 查询同次结果，响应同上。标识是客户端随机 UUID；参数相同的重复提交共享同一结果，参数不同拒绝 `worktree-operation-conflict`。仅已明确失败的继续允许 `retry:true`；复用同一目标会话文件，不再次fork。结果写入宿主私有操作记录，连接断开不取消服务端操作。进程重启后，已完整落盘的会话副本可由同次标识恢复；其他未记录最终结果的操作返回 `unknown`，不重放写操作；客户端保持待确认并允许再次查询，不能当失败重新复制会话。
+- 拒绝错误帧携带 `queryId` 或 `operationId`。错误只给稳定码与短文案，不回显 Git/OS 原始 stderr。可用码：`worktree-not-git`、`worktree-target-unavailable`、`worktree-branch-invalid`、`worktree-base-invalid`、`worktree-no-commits`、`worktree-path-invalid`、`worktree-path-exists`、`worktree-create-failed`、`worktree-busy`、`worktree-queued`、`worktree-model-unavailable`、`worktree-continue-failed`、`worktree-result-unknown`、`worktree-operation-not-found`、`worktree-operation-conflict`、`worktree-operation-invalid`、`worktree-git-failed`、`worktree-source-changed`、`worktree-trust-required`。
+
+首页选择只设置新会话目录；会话内“新建会话”回首页，首条消息才创建；会话内“继续”才调用继续端点。客户端在权威成功后同时更新订阅、历史、目录与草稿归属，失败或未知不清源草稿。旧网关的其他功能保持原协议。
+
 ## 5. 管理面（localhost HTTP，不面向移动端）
 
 | 方法与路径 | 说明 |

@@ -8,6 +8,14 @@ import {
 	sessionInputResources,
 } from "./input-assist.ts";
 import { ENTRY_COPY_MAX_BYTES, entryCopyText, type TreeViewOptions } from "./tree-view.ts";
+import {
+	createWorktree,
+	listWorktrees,
+	WorktreeError,
+	type WorktreeOperation,
+	WorktreeOperations,
+	workspaceDirectory,
+} from "./worktrees.ts";
 // Pi runtime: drives pi agent sessions in-process through the public SDK.
 //
 // This module owns everything session-shaped on the gateway side:
@@ -33,9 +41,13 @@ import { join, resolve } from "node:path";
 import {
 	type AgentSessionEvent,
 	createAgentSession,
+	createAgentSessionFromServices,
+	createAgentSessionServices,
 	getAgentDir,
+	hasTrustRequiringProjectResources,
 	initTheme,
 	ModelRuntime,
+	ProjectTrustStore,
 	type PromptOptions,
 	resolveModelScopeWithDiagnostics,
 	type SessionEntry,
@@ -254,6 +266,8 @@ interface LiveHandle {
 	admissionTail: Promise<void>;
 	/** 包括SDK await abort的启动期；同会话调用完成前不重复触发。 */
 	manualCompaction?: Promise<unknown>;
+	workspaceContinuing?: boolean;
+	workspaceControls?: number;
 	disposed: boolean;
 	/** 统一出站 FIFO：所有 wire 事件先入队，在微任务里批量 flush。 */
 	pendingFrames: PendingFrame[];
@@ -413,6 +427,7 @@ export class PiRuntime {
 	/** In-flight open/create builders, so concurrent requests share one build
 	 * instead of racing into duplicate AgentSessions (pi-web startLocks). */
 	private readonly openingLocks = new Map<string, Promise<SessionHandle>>();
+	private worktreeOperations: WorktreeOperations | undefined;
 	private readonly creatingLocks = new Map<string, Promise<SessionHandle>>();
 	private sweepTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -519,7 +534,7 @@ export class PiRuntime {
 
 	// -- session factory ------------------------------------------------------
 
-	private async createRealSession(sessionManager: SessionManager): Promise<PiSessionLike> {
+	private async createRealSession(sessionManager: SessionManager, workspace = false): Promise<PiSessionLike> {
 		if (!this.realFactoryThemeInitialized) {
 			// Extensions loaded from the user's setup may touch the global
 			// theme even outside a terminal UI (pi-web does the same).
@@ -553,7 +568,7 @@ export class PiRuntime {
 			},
 			this.savedDefaultModelRef(),
 		);
-		const { session } = await createAgentSession({
+		const sessionOptions = {
 			cwd: sessionManager.getCwd(),
 			sessionManager,
 			modelRuntime,
@@ -562,7 +577,28 @@ export class PiRuntime {
 			// options.thinkingLevel = savedInScope.thinkingLevel 对齐）。
 			...(selection.entry?.thinkingLevel ? { thinkingLevel: selection.entry.thinkingLevel } : {}),
 			...(selection.scopedModels.length > 0 ? { scopedModels: selection.scopedModels } : {}),
-		});
+		};
+		const result = workspace
+			? await createAgentSessionFromServices({
+					...sessionOptions,
+					services: await createAgentSessionServices({
+						cwd: sessionManager.getCwd(),
+						agentDir: this.agentDir,
+						modelRuntime,
+						settingsManager: SettingsManager.create(sessionManager.getCwd(), this.agentDir, { projectTrusted: false }),
+						resourceLoaderReloadOptions: {
+							resolveProjectTrust: async () =>
+								!hasTrustRequiringProjectResources(sessionManager.getCwd()) ||
+								new ProjectTrustStore(this.agentDir ?? getAgentDir()).get(sessionManager.getCwd()) === true,
+						},
+					}),
+				})
+			: await createAgentSession(sessionOptions);
+		if (workspace && result.modelFallbackMessage) {
+			result.session.dispose();
+			throw new WorktreeError("worktree-model-unavailable");
+		}
+		const { session } = result;
 		if (typeof session.bindExtensions === "function") {
 			try {
 				await session.bindExtensions({ mode: "rpc" });
@@ -575,8 +611,9 @@ export class PiRuntime {
 		return session;
 	}
 
-	private async buildSession(sessionManager: SessionManager): Promise<LiveHandle> {
-		const factory = this.sessionFactoryOverride ?? ((options) => this.createRealSession(options.sessionManager));
+	private async buildSession(sessionManager: SessionManager, workspace = false): Promise<LiveHandle> {
+		const factory =
+			this.sessionFactoryOverride ?? ((options) => this.createRealSession(options.sessionManager, workspace));
 		const session = await factory({ sessionManager });
 		// Idempotency guard: a live handle for this id may have appeared while
 		// the factory ran (concurrent build, duplicate file headers). Drop the
@@ -601,6 +638,7 @@ export class PiRuntime {
 			admissionTail: Promise.resolve(),
 			disposed: false,
 			pendingFrames: [],
+			workspaceContinuing: workspace,
 			customEntryCursor: sessionManager.getEntries().length,
 			flushScheduled: false,
 		};
@@ -617,7 +655,12 @@ export class PiRuntime {
 		if (excess <= 0) return;
 		const evictable = [...this.handles.values()]
 			.filter(
-				(handle) => handle.subscribers.size === 0 && !handle.session.isStreaming && !this.isHandleCompacting(handle),
+				(handle) =>
+					handle.subscribers.size === 0 &&
+					!handle.session.isStreaming &&
+					!this.isHandleCompacting(handle) &&
+					!handle.workspaceContinuing &&
+					!handle.workspaceControls,
 			)
 			.sort((a, b) => a.lastActivity - b.lastActivity);
 		for (const victim of evictable) {
@@ -832,6 +875,176 @@ export class PiRuntime {
 		return this.toPublicHandle(handle);
 	}
 
+	private workspaceJournal(): WorktreeOperations {
+		if (!this.worktreeOperations)
+			this.worktreeOperations = new WorktreeOperations(
+				join(this.agentDir ?? getAgentDir(), "mobile-worktree-operations"),
+			);
+		return this.worktreeOperations;
+	}
+
+	async worktreeList(cwd?: string, sessionId?: string) {
+		if (sessionId) {
+			await this.openSession(sessionId);
+			cwd = this.handles.get(sessionId)?.sessionManager.getCwd();
+		}
+		if (!cwd) throw new WorktreeError("worktree-target-unavailable");
+		return listWorktrees(cwd);
+	}
+
+	async worktreeCreate(operationId: string, cwd: string, branch: string, base: string, targetPath: string) {
+		const initial: WorktreeOperation = { operationId, action: "create", status: "pending", cwd: targetPath };
+		return this.workspaceJournal().run(
+			operationId,
+			JSON.stringify(["create", cwd, branch, base, targetPath]),
+			initial,
+			async () => {
+				const worktree = await createWorktree(cwd, branch, base, targetPath);
+				return { ...initial, status: "succeeded", cwd: worktree.path, worktree };
+			},
+		);
+	}
+
+	async worktreeStatus(operationId: string): Promise<WorktreeOperation> {
+		const result = this.workspaceJournal().status(operationId);
+		if (result.status !== "unknown" || result.action !== "continue" || !result.targetSessionId || !result.cwd)
+			return result;
+		const path = SessionManager.findById(result.cwd, result.targetSessionId, this.sessionDir);
+		if (!path) return result;
+		try {
+			this.worktreeTrust(result.cwd);
+			const manager = SessionManager.open(path, this.sessionDir);
+			const expected = manager.buildSessionContext();
+			const target = await this.buildSession(manager, true);
+			this.requireWorkspaceModel(target, expected);
+			target.workspaceContinuing = false;
+			const settled: WorktreeOperation = { ...result, status: "succeeded", code: undefined };
+			this.workspaceJournal().complete(operationId, settled);
+			this.invalidateIndex();
+			return settled;
+		} catch {
+			return result;
+		}
+	}
+
+	private requireWorkspaceModel(target: LiveHandle, expected: ReturnType<SessionManager["buildSessionContext"]>): void {
+		if (
+			(expected.model &&
+				(target.session.model?.id !== expected.model.modelId ||
+					target.session.model?.provider !== expected.model.provider)) ||
+			target.session.thinkingLevel !== expected.thinkingLevel
+		) {
+			if (target.workspaceContinuing) this.disposeHandle(target);
+			throw new WorktreeError("worktree-model-unavailable");
+		}
+	}
+
+	private requireWorkspaceIdle(live: LiveHandle): void {
+		if (live.workspaceContinuing || live.workspaceControls || live.session.isStreaming || this.isHandleCompacting(live))
+			throw new WorktreeError("worktree-busy");
+		if (live.session.getSteeringMessages().length || live.session.getFollowUpMessages().length)
+			throw new WorktreeError("worktree-queued");
+	}
+
+	worktreeTrust(targetPath: string, trustProject = false): string {
+		const canonicalTarget = workspaceDirectory(targetPath);
+		const trust = new ProjectTrustStore(this.agentDir ?? getAgentDir());
+		if (hasTrustRequiringProjectResources(canonicalTarget) && trust.get(canonicalTarget) !== true) {
+			if (!trustProject) throw new WorktreeError("worktree-trust-required");
+			trust.set(canonicalTarget, true);
+		}
+		return canonicalTarget;
+	}
+
+	async continueWorkspace(
+		operationId: string,
+		sessionId: string,
+		targetPath: string,
+		trustProject = false,
+		retry = false,
+	): Promise<WorktreeOperation> {
+		targetPath = this.worktreeTrust(targetPath, trustProject);
+		if (operationId === sessionId) throw new WorktreeError("worktree-operation-conflict");
+		const previousResult = this.workspaceJournal().previous(operationId);
+		const initial: WorktreeOperation = {
+			operationId,
+			action: "continue",
+			status: "pending",
+			sessionId,
+			cwd: targetPath,
+		};
+		return this.workspaceJournal().run(
+			operationId,
+			JSON.stringify(["continue", sessionId, targetPath]),
+			initial,
+			async () => {
+				await this.openSession(sessionId);
+				const source = this.handles.get(sessionId);
+				if (!source || source.disposed) throw new WorktreeError("worktree-continue-failed");
+				await source.admissionTail;
+				if (source.disposed || this.handles.get(sessionId) !== source)
+					throw new WorktreeError("worktree-source-changed");
+				this.requireWorkspaceIdle(source);
+				const cwd = workspaceDirectory(targetPath);
+				if (cwd === workspaceDirectory(source.sessionManager.getCwd()))
+					return { ...initial, status: "succeeded", cwd, targetSessionId: sessionId };
+				const sourcePath = source.sessionManager.getSessionFile();
+				if (!sourcePath) throw new WorktreeError("worktree-continue-failed");
+				source.workspaceContinuing = true;
+				try {
+					const leaf = this.currentLeafId(source);
+					const model = source.session.model;
+					const thinking = source.session.thinkingLevel;
+					const previous = SessionManager.findById(cwd, operationId, this.sessionDir);
+					if (previous && (previousResult?.targetSessionId !== operationId || previousResult.cwd !== cwd))
+						throw new WorktreeError("worktree-operation-conflict");
+					const manager = previous
+						? SessionManager.open(previous, this.sessionDir)
+						: SessionManager.forkFrom(sourcePath, cwd, this.sessionDir, { id: operationId });
+					if (manager.getHeader()?.parentSession !== sourcePath) throw new WorktreeError("worktree-operation-conflict");
+					const sourceEntries = source.sessionManager.getEntries();
+					const copied = manager.getEntries();
+					if (sourceEntries.length > copied.length || sourceEntries.some((entry, i) => entry.id !== copied[i]?.id))
+						throw new WorktreeError("worktree-source-changed");
+					if (leaf && !manager.getEntry(leaf)) throw new WorktreeError("worktree-source-changed");
+					// forkFrom 保留完整树；branch 只改内存。追加真实设置把选中链持久化，重开也不会回到文件尾另一分支。
+					if (!previous) {
+						if (leaf) manager.branch(leaf);
+						else manager.resetLeaf();
+						if (model) manager.appendModelChange(model.provider, model.id);
+						manager.appendThinkingLevelChange(thinking);
+					} else {
+						const sourceIds = new Set(sourceEntries.map((entry) => entry.id));
+						const copiedLeaf =
+							manager
+								.getBranch()
+								.filter((entry) => sourceIds.has(entry.id))
+								.at(-1)?.id ?? null;
+						const context = manager.buildSessionContext();
+						if (
+							copiedLeaf !== leaf ||
+							context.model?.modelId !== model?.id ||
+							context.model?.provider !== model?.provider ||
+							context.thinkingLevel !== thinking
+						)
+							throw new WorktreeError("worktree-source-changed");
+					}
+					// 仅在完整副本和活动链已落盘后公布目标ID；重启查询可复用它，绝不再次fork。
+					this.workspaceJournal().checkpoint(operationId, { targetSessionId: manager.getSessionId(), cwd });
+					const expected = manager.buildSessionContext();
+					const target = await this.buildSession(manager, true);
+					this.requireWorkspaceModel(target, expected);
+					target.workspaceContinuing = false;
+					this.invalidateIndex();
+					return { ...initial, status: "succeeded", cwd, targetSessionId: target.session.sessionId };
+				} finally {
+					source.workspaceContinuing = false;
+				}
+			},
+			retry,
+		);
+	}
+
 	/** Get an already-loaded handle, if any (never loads). */
 	peekSession(sessionId: string): PiSessionLike | undefined {
 		return this.handles.get(sessionId)?.session;
@@ -892,6 +1105,7 @@ export class PiRuntime {
 		});
 		await previous;
 		try {
+			if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 			live.lastActivity = this.now();
 			const disposition = await new Promise<"started" | "queued" | "handled" | undefined>((resolve, reject) => {
 				let settled = false;
@@ -1432,6 +1646,7 @@ export class PiRuntime {
 		const handle = await this.openSession(sessionId);
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
+		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		// Touch the handle before any await so the idle sweeper cannot reclaim
 		// the session while the registry (first call: full `ModelRuntime.create()`
 		// disk read) resolves.
@@ -1440,6 +1655,8 @@ export class PiRuntime {
 		const model = registry.getModel(provider, modelId);
 		if (model === undefined) throw new ModelChangeError(`unknown model: ${provider}/${modelId}`);
 		if (live.disposed) throw new SessionNotFoundError(sessionId);
+		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
+		live.workspaceControls = (live.workspaceControls ?? 0) + 1;
 		try {
 			await handle.session.setModel(model, { persist: false });
 			if (thinkingLevel !== undefined) handle.session.setThinkingLevel(thinkingLevel);
@@ -1447,6 +1664,8 @@ export class PiRuntime {
 			// pi's own validation (no API key for the provider, …) is
 			// client-actionable and carries no filesystem paths.
 			throw new ModelChangeError(error instanceof Error ? error.message : String(error));
+		} finally {
+			live.workspaceControls -= 1;
 		}
 		if (live.disposed) throw new SessionNotFoundError(sessionId);
 		return this.liveState(sessionId, live);
@@ -1460,6 +1679,7 @@ export class PiRuntime {
 		const handle = await this.openSession(sessionId);
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
+		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		live.lastActivity = this.now();
 		try {
 			handle.session.setSessionName(name);
@@ -1480,6 +1700,7 @@ export class PiRuntime {
 	 */
 	async restartSession(sessionId: string): Promise<WireSessionState> {
 		const existing = this.handles.get(sessionId);
+		if (existing?.workspaceContinuing || existing?.workspaceControls) throw new WorktreeError("worktree-busy");
 		if (existing && !existing.disposed && (existing.session.isStreaming || this.isHandleCompacting(existing))) {
 			throw new SessionRestartError(sessionId);
 		}
@@ -1503,6 +1724,7 @@ export class PiRuntime {
 		const handle = await this.openSession(sessionId);
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
+		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		live.lastActivity = this.now();
 		if (!live.manualCompaction) {
 			const pending: Promise<unknown> = Promise.resolve()
@@ -1682,6 +1904,7 @@ export class PiRuntime {
 	}> {
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
+		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		if (this.isHandleCompacting(live)) {
 			throw new SessionNameError("压缩进行中，请等压缩完成后再切换分支");
 		}
@@ -1698,38 +1921,43 @@ export class PiRuntime {
 			};
 		}
 
-		// 流式中对齐 pi TUI：取走排队消息（TUI 会恢复进编辑器），中止当前运行。
-		const queued: string[] = [];
-		if (live.session.isStreaming) {
-			queued.push(...live.session.getSteeringMessages(), ...live.session.getFollowUpMessages());
-		}
-		if (live.session.isStreaming) {
-			await live.session.abort();
-		}
+		live.workspaceControls = (live.workspaceControls ?? 0) + 1;
+		try {
+			// 流式中对齐 pi TUI：取走排队消息（TUI 会恢复进编辑器），中止当前运行。
+			const queued: string[] = [];
+			if (live.session.isStreaming) {
+				queued.push(...live.session.getSteeringMessages(), ...live.session.getFollowUpMessages());
+			}
+			if (live.session.isStreaming) {
+				await live.session.abort();
+			}
 
-		const session = live.session as unknown as {
-			navigateTree: (
-				targetId: string,
-				options: { summarize: boolean },
-			) => Promise<{ editorText?: string; cancelled?: boolean }>;
-		};
-		live.lastActivity = this.now();
-		const result = await session.navigateTree(entryId, { summarize: false });
-		if (result.cancelled) {
-			// pi 的 accept 层拒绝（LaneBusy/UnknownTarget 等）：如实映射 bad-request。
-			throw new SessionNameError(result.editorText ?? "切换被拒绝");
+			const session = live.session as unknown as {
+				navigateTree: (
+					targetId: string,
+					options: { summarize: boolean },
+				) => Promise<{ editorText?: string; cancelled?: boolean }>;
+			};
+			live.lastActivity = this.now();
+			const result = await session.navigateTree(entryId, { summarize: false });
+			if (result.cancelled) {
+				// pi 的 accept 层拒绝（LaneBusy/UnknownTarget 等）：如实映射 bad-request。
+				throw new SessionNameError(result.editorText ?? "切换被拒绝");
+			}
+			const newLeafId = this.currentLeafId(live);
+			if (newLeafId !== null) this.manualLeafIds.set(sessionId, newLeafId);
+			this.labelLeafPins.delete(sessionId);
+			return {
+				entryId,
+				leafId: newLeafId,
+				alreadyAt: false,
+				editorText: typeof result.editorText === "string" ? result.editorText : null,
+				queued,
+				state: this.liveState(sessionId, live),
+			};
+		} finally {
+			live.workspaceControls -= 1;
 		}
-		const newLeafId = this.currentLeafId(live);
-		if (newLeafId !== null) this.manualLeafIds.set(sessionId, newLeafId);
-		this.labelLeafPins.delete(sessionId);
-		return {
-			entryId,
-			leafId: newLeafId,
-			alreadyAt: false,
-			editorText: typeof result.editorText === "string" ? result.editorText : null,
-			queued,
-			state: this.liveState(sessionId, live),
-		};
 	}
 
 	/**
@@ -1776,6 +2004,7 @@ export class PiRuntime {
 		const live = this.handles.get(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		if (!live.sessionManager.getEntry(entryId)) throw new EntryNotFoundError(entryId);
+		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		// 目标已同步核对；落盘异常应由 router 按 internal 收尾，不能伪报条目不存在。
 		const labelEntryId = live.sessionManager.appendLabelChange(entryId, label);
 		const leafId = this.currentLeafId(live);
@@ -2155,6 +2384,7 @@ export class PiRuntime {
 	sweep(): void {
 		for (const handle of this.handles.values()) {
 			if (handle.subscribers.size > 0) continue;
+			if (handle.workspaceContinuing || handle.workspaceControls) continue;
 			if (handle.session.isStreaming || this.isHandleCompacting(handle)) continue;
 			if (this.now() - handle.lastActivity < this.idleDisposeMs) continue;
 			this.log(`disposing idle session ${handle.session.sessionId}`);

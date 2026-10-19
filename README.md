@@ -2,7 +2,7 @@
 
 让手机通过**设备鉴权的 WebSocket** 连接并使用本机的 [pi](https://github.com/earendil-works/pi) coding agent：把 pi 的会话、实时回复和 Agent 执行轨迹带到移动端。
 
-配套 Android 客户端为 [pi-mobile-android](https://github.com/LiuChen19960902/pi-mobile-android)，版本 Android 1.0.0 ↔ gateway 0.3.0。网关使用锁定的 Pi SDK 1.3.0；终端 Pi 的安装与网关 npm 依赖独立，升级后需核对两者契约。
+配套 Android 客户端为 [pi-mobile-android](https://github.com/LiuChen19960902/pi-mobile-android)，版本 Android 1.1.0 ↔ gateway 0.4.0。网关使用锁定的 Pi SDK 1.3.0；终端 Pi 的安装与网关 npm 依赖独立，升级后需核对两者契约。
 
 ## 架构
 
@@ -70,6 +70,7 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 | `providers` / `provider-put` / `provider-delete` | 手机端读写宿主 models.json（`apiKey` 盲存盲回，缺省保留） |
 | `provider-test` / `provider-models` | 逐模型协议与 Base URL 的上游连通性测试/ 拉取上游模型清单；两者会让网关向用户填写的 `baseUrl` 发起出站请求 |
 | `directories` / `directory-create` / `workspace-create` | 宿主目录浏览、新建文件夹、新会话落点 |
+| `worktree-list` / `worktree-create` / `worktree-continue` / `worktree-status` / `worktree-trust` | 工作区发现、新建、带当前对话继续、操作结果查询与项目信任；特性名 `worktree-v1`，详见 §4.28 |
 | `tree` / `switch-branch` | Pi 会话树与活动位置切换（需先 `subscribe` 打开会话），支持搜索、筛选与折叠 |
 | `entry-copy` / `label-put` | 树页动作：整条 entry 的可复制全文（Pi Ctrl+X，>512 KiB 只报 `oversized`）/ 标签写（Pi Shift+L，需 live 会话；追加 `LabelEntry` 并推进叶子）；特性名 `tree-actions-v1` |
 | `restart-session` | 重建会话（对齐桌面 pi 重开语义） |
