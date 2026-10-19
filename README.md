@@ -77,6 +77,7 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 | `commands` | 自定义命令清单（扩展/模板/skill 三源） |
 | `input-resources` / `input-completions` | 当前工作区的 Skill/Prompt 发现与 `@` 文件/目录补全 |
 | `attachment` | 按条目按需取回历史图片（单图 ≤4 MiB，缓存优先） |
+| `extension-status` | 扩展通过 Pi 公开 `ctx.ui.setStatus` 发布的会话状态行（如“1 agent running”）；订阅/重建应答带快照，实时变化整份推送 |
 
 事件（`message_start/update/end`、`tool_execution_*`、`agent_*`、`queue_update`、`compaction_*`…）与 pi 自家 RPC 协议同词表；会话在内存中按需加载、空闲 5 分钟释放，**运行中的会话即使手机断线也跑完**。
 
@@ -144,4 +145,4 @@ node scripts/smoke-verify.mjs --prompt                     # 附加一条真实�
 - 图片附件、模型切换、会话树导航、Provider 管理、目录浏览与输入补全已实现（见上方帧/说明表）；
 - 局域网明文 `ws://` 仅限可信网络；公网必须 `wss://` + 反向代理；
 - Provider API Key 由手机表单经 `provider-put` 写入宿主 models.json（网关盲存盲回、不做 OAuth/刷新）；
-- 扩展 UI 交互（`extension_ui_request`）由 pi 的 no-op 兜底自动取消，尚无移动端审批等价物。
+- 扩展 UI 交互只桥接 `ctx.ui.setStatus` 状态行；对话框由网关 `uiContext` 立即返回取消值兜底，通知/widget 不显示，尚无移动端审批等价物。

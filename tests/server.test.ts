@@ -549,6 +549,7 @@ describe("hello capabilities advertisement", () => {
 				"provider-model-base-url-v1",
 				"provider-test-id-v1",
 				"prompt-disposition-v1",
+				"extension-status",
 			].sort(),
 			"capabilities 必须与 ClientFrameType 全量一致",
 		);

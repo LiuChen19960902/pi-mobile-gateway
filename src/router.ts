@@ -367,7 +367,9 @@ export function connectClient(
 					}
 					const handle = await runtime.openSession(sessionId);
 					subscribe(sessionId, handle);
-					send({ kind: "subscribed", sessionId });
+					// 订阅确认同时下发扩展状态快照（PROTOCOL §4.29）：重连后不必
+					// 等下一次 setStatus 才恢复“有 agent 在跑”的提示。
+					send({ kind: "subscribed", sessionId, statuses: runtime.extensionStatuses(sessionId) });
 					return;
 				}
 
@@ -877,7 +879,13 @@ export function connectClient(
 					// 应答按 state 快照形状下发；客户端随后以 resetLeaf 重拉 history
 					// 完成会话视图重建（与重连 catch-up 同通道）。摘除走 session 级
 					//（unsubscribe/close 经 runtime.unsubscribe），此处无需刷新。
-					send({ kind: "session-restarted", ...state, sessionId });
+					send({
+						kind: "session-restarted",
+						...state,
+						sessionId,
+						// 重建后的会话从空状态开始；随应答清空旧状态行（其他订阅者由 runtime 广播同一快照）。
+						statuses: runtime.extensionStatuses(sessionId),
+					});
 					return;
 				}
 

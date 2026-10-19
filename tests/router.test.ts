@@ -120,6 +120,15 @@ class FakeSession implements PiSessionLike {
 		return Promise.resolve();
 	}
 
+	bindings: Record<string, unknown> | undefined;
+	/** Test hook: run during extension binding (e.g. publish ui.setStatus). */
+	onBind: ((bindings: Record<string, unknown>) => void) | undefined;
+	bindExtensions(bindings: Record<string, unknown>): Promise<void> {
+		this.bindings = bindings;
+		this.onBind?.(bindings);
+		return Promise.resolve();
+	}
+
 	steeringMessages: string[] = [];
 	followUpMessages: string[] = [];
 	getSteeringMessages(): readonly string[] {
@@ -407,6 +416,8 @@ async function startHarness(
 		enabledModelsAppender?: (pattern: string) => void;
 		enabledModelsRemover?: (pattern: string) => void;
 		enabledModelsSetter?: (patterns: string[]) => void;
+		/** Test hook after each fake session is constructed, before binding. */
+		configureSession?: (session: FakeSession) => void;
 	} = {},
 ): Promise<Harness> {
 	const sessionDir = tempDir("pi-mgw-router-sessions-");
@@ -424,6 +435,7 @@ async function startHarness(
 		enabledModelsSetter: options.enabledModelsSetter,
 		sessionFactory: async ({ sessionManager }) => {
 			const session = new FakeSession(sessionManager);
+			options.configureSession?.(session);
 			sessions.set(session.sessionId, session);
 			return session;
 		},
@@ -551,13 +563,87 @@ describe("router: sessions / history / state", () => {
 		const harness = await startHarness();
 		const client = await harness.connectPaired();
 		client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
-		assert.equal((await client.nextMessage()).kind, "subscribed");
+		const subscribed = await client.nextMessage();
+		assert.equal(subscribed.kind, "subscribed");
+		assert.deepEqual(subscribed.statuses, []);
 		client.send(JSON.stringify({ type: "state", sessionId: SESSION_ID }));
 		const response = await client.nextMessage();
 		assert.equal(response.kind, "state");
 		assert.deepEqual(response.model, { provider: "p1", modelId: "m1" });
 		assert.deepEqual(response.contextUsage, { percent: 42, contextWindow: 100_000, tokens: 42_000 });
 		client.close();
+	});
+
+	it("bridges extension ctx.ui.setStatus to snapshots and live frames", async () => {
+		const harness = await startHarness();
+		const client = await harness.connectPaired();
+		try {
+			client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+			const subscribed = await client.nextMessage();
+			assert.equal(subscribed.kind, "subscribed");
+			assert.deepEqual(subscribed.statuses, []);
+
+			const session = expectSession(harness.sessions, SESSION_ID);
+			const uiContext = session.bindings?.uiContext as { setStatus(key: string, text?: string): void } | undefined;
+			assert.ok(uiContext, "bindExtensions must receive a uiContext");
+
+			// TUI 颜色转义与换行在网关侧规整；手机只显示纯文本一行。
+			uiContext.setStatus("subagents", "\u001b[2m1 agent running\u001b[22m");
+			const live = await client.nextMessage();
+			assert.equal(live.kind, "extension-status");
+			assert.equal(live.sessionId, SESSION_ID);
+			assert.deepEqual(live.statuses, [{ key: "subagents", text: "1 agent running" }]);
+
+			// 订阅快照是重连后的恢复路径，必须携带当前状态。
+			client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+			const resubscribed = await client.nextMessage();
+			assert.equal(resubscribed.kind, "subscribed");
+			assert.deepEqual(resubscribed.statuses, [{ key: "subagents", text: "1 agent running" }]);
+
+			uiContext.setStatus("subagents", undefined);
+			const cleared = await client.nextMessage();
+			assert.equal(cleared.kind, "extension-status");
+			assert.deepEqual(cleared.statuses, []);
+		} finally {
+			client.close();
+		}
+	});
+
+	it("restart broadcasts the new extension snapshot even when the old one was empty", async () => {
+		let created = 0;
+		const harness = await startHarness({
+			configureSession: (session) => {
+				created += 1;
+				// 第二个实例对应 restart 后的新会话：扩展在 session_start 就发布状态。
+				if (created === 2) {
+					session.onBind = (bindings) => {
+						const uiContext = bindings.uiContext as { setStatus(key: string, text?: string): void };
+						uiContext.setStatus("demo", "1 agent running");
+					};
+				}
+			},
+		});
+		const clientA = await harness.connectPaired();
+		const clientB = await harness.connectPaired();
+		for (const client of [clientA, clientB]) {
+			client.send(JSON.stringify({ type: "subscribe", sessionId: SESSION_ID }));
+			assert.equal((await client.nextMessage()).kind, "subscribed");
+		}
+
+		clientA.send(JSON.stringify({ type: "restart-session", sessionId: SESSION_ID }));
+		const aStatus = await clientA.nextMessage();
+		assert.equal(aStatus.kind, "extension-status");
+		assert.deepEqual(aStatus.statuses, [{ key: "demo", text: "1 agent running" }]);
+		const restarted = await clientA.nextMessage();
+		assert.equal(restarted.kind, "session-restarted");
+		assert.deepEqual(restarted.statuses, [{ key: "demo", text: "1 agent running" }]);
+
+		// 非发起方连接也必须收到首份快照，而不是停留在旧（空）状态。
+		const bStatus = await clientB.nextMessage();
+		assert.equal(bStatus.kind, "extension-status");
+		assert.deepEqual(bStatus.statuses, [{ key: "demo", text: "1 agent running" }]);
+		clientA.close();
+		clientB.close();
 	});
 });
 
@@ -1456,10 +1542,18 @@ describe("router: subscriptions", () => {
 			assert.equal((await client.nextMessage()).kind, "subscribed");
 		}
 		// A 触发重建：新 handle 迁移了 sinks，旧 detach 已失效。
+		// 迁移后无条件补一份空状态快照（旧状态为空也要清掉旧客户端残留）。
 		clientA.send(JSON.stringify({ type: "restart-session", sessionId: SESSION_ID }));
+		const aStatus = await clientA.nextMessage();
+		assert.equal(aStatus.kind, "extension-status");
+		assert.deepEqual(aStatus.statuses, []);
 		assert.equal((await clientA.nextMessage()).kind, "session-restarted");
 		clientA.send(JSON.stringify({ type: "unsubscribe", sessionId: SESSION_ID }));
 		assert.equal((await clientA.nextMessage()).kind, "unsubscribed");
+		// B 也收到同一份空快照（非发起方不能保留旧状态）。
+		const bStatus = await clientB.nextMessage();
+		assert.equal(bStatus.kind, "extension-status");
+		assert.deepEqual(bStatus.statuses, []);
 		// restart 建了新 FakeSession（sessionFactory 覆盖同 id）：在新实例上打事件。
 		const session = expectSession(harness.sessions, SESSION_ID);
 		session.emit({ type: "queue_update", steering: ["s"], followUp: [] } as AgentSessionEvent);
