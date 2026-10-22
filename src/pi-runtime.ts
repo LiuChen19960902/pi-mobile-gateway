@@ -42,7 +42,7 @@ import {
 //     mid-run ("pi runs on the machine, the phone is just a remote").
 
 import { existsSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	type AgentSessionEvent,
 	createAgentSession,
@@ -2425,6 +2425,8 @@ export class PiRuntime {
 	 *
 	 * 读取路径：先查同 session 的 live SessionManager（覆盖新会话尚未落盘的
 	 * 消息）；live 不存在或其中没有该 entry 时，再读该会话当前文件视图
+	 * bridge 的 sourceFile 仅来自服务端注册描述符：只认原生文件视图，跳过
+	 * 旧 SDK live，避免跨运行器读到旧图片。客户端路径不能传到此参数。
 	 * （桌面 pi 后来追加的条目，live 内存快照可能看不到；(mtime,size) 门控
 	 * 缓存对并发追加已失效自刷新）。两处都以 session 身份为归属校验。
 	 */
@@ -2432,6 +2434,8 @@ export class PiRuntime {
 		sessionId: string,
 		entryId: string,
 		imageIndex: number,
+		/** Server-owned native descriptor path; never accept this from a client frame. */
+		sourceFile?: string,
 	): Promise<{
 		sessionId: string;
 		entryId: string;
@@ -2440,8 +2444,15 @@ export class PiRuntime {
 		bytes: number;
 		dataBase64: string;
 	}> {
+		if (sourceFile !== undefined) {
+			try {
+				if (!isAbsolute(sourceFile) || !statSync(sourceFile).isFile()) throw new SessionNotFoundError(sessionId);
+			} catch {
+				throw new SessionNotFoundError(sessionId);
+			}
+		}
 		let entry: SessionEntry | undefined;
-		const live = await this.readyHandle(sessionId);
+		const live = sourceFile === undefined ? await this.readyHandle(sessionId) : undefined;
 		if (live && !live.disposed) {
 			try {
 				entry = live.sessionManager.getEntry(entryId);
@@ -2451,8 +2462,8 @@ export class PiRuntime {
 			}
 		}
 		if (!entry) {
-			const path = await this.resolveSessionPath(sessionId);
-			if (path === null) throw new SessionNotFoundError(sessionId);
+			const path = sourceFile ?? (await this.resolveSessionPath(sessionId));
+			if (path === null || !existsSync(path)) throw new SessionNotFoundError(sessionId);
 			const manager = this.openSessionManager(path);
 			// 文件头 id 是权威身份：陈旧索引解析到别的会话文件时按未找到处理。
 			if (manager.getSessionId() !== sessionId) throw new SessionNotFoundError(sessionId);

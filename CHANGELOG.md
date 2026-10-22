@@ -4,6 +4,8 @@
 
 ### Added
 
+- `bridge` / `host-mode` / `host-mode-put`：连接电脑上已加载桥接扩展的原生 Pi 实例，按会话 `instanceId+epoch` 隔离实时状态，写请求按 `operationId` 去重；桥接模式操作同一个原生实例，并支持后台启动、模型/思考切换、上下文压缩、会话树与输入补全；会话/Worktree动作复用原生公开API。
+- `bridge-start`：对离线会话在宿主 tmux 中后台启动带桥接扩展的原生 Pi，等注册表出现描述符才回 `bridge-started`；按 `operationId` 与 `sessionId` 双重去重，超时回 `launch-result-unknown`。附带 `pi-mobile attach <sessionId>` 附着入口。
 - `extension-status` 帧与同名能力：通过 Pi 公开扩展 API `ctx.ui.setStatus` 发布会话级状态行（子 agent 运行、后台任务等），`subscribed` / `session-restarted` 携带快照，实时变化以完整快照推送；网关只桥接这一显示原语，其余扩展 UI 方法保持 no-op。状态是显示提示，不定义任务终态，也不参与会话保活。
 - `attachment` 帧：按 `sessionId + entryId + imageIndex` 从 pi 会话条目按需取回历史图片（活动会话优先、回落文件视图；单图原始 ≤4 MiB；错误以关联三元组回显）；`hello.capabilities` 增加 `attachment`。
 - 事件帧新增顶层 `entryId`（pi 条目身份）：在 pi emit→append 微任务窗口后按对象引用匹配 `SessionManager.getEntries()` 得出，history 平行 `entryIds` 对应；客户端据此做实时/历史消息身份合并。
@@ -26,6 +28,8 @@
 
 - 手动压缩的启动等待也计入运行中状态，同会话重复触发合并；结束后排空 Pi 事件并通知最终状态，避免抽屉残留进行中。
 - 消息回执区分输入已消费与运行结束；停止和独立队列取回对齐 Pi 的 clearQueue / abort 语义。
+- 桥接 IPC 单帧统一按字节限制 24 MiB：扩展响应超限以同 id 回 `frame-too-large`，网关读缓冲超限先拒绝在途请求再关闭 socket，不再把超限误报为 `bridge-offline`。
+- 桥接事件只在 `bridge-snapshot` 建立新代际；旧 epoch 迟到事件丢弃，同代际倒退 `bridgeSeq` 丢弃。模式切换释放旧订阅并通知客户端，避免旧订阅静默失效。
 - 出站截断保持 UTF-16 代理对完整（`src/wire.ts` `truncateUtf16`）：正文（`WIRE_TEXT_MAX_CHARS`）、树预览（`TREE_PREVIEW_MAX_CHARS`）与 assistant 错误预览三处按 UTF-16 单元截断时，切点若落在有效代理对中间则退一单元，不再产生孤立代理（严格上游/客户端会拒收含孤立代理的整帧）。
 - `POST /mgw/devices/:id/revoke` 强制 `application/json`（缺省/错误类型 → 415），与 `/mgw/pair` 同口径。
 - `workspace-create` 已存在文件时报 `bad-request`“不是目录”（原 `internal`）。

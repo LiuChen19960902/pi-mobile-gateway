@@ -10,7 +10,7 @@
 // network.
 //
 // Machine-readable stdout contract (everything else must go to stderr):
-//   FIXTURE_READY {"dataPort":N,"mgmtPort":N,"pairingText":"...","fixtureSessionId":"...","fixtureCwd":"..."}
+//   FIXTURE_READY {"dataPort":N,"mgmtPort":N,"pairingText":"...","shortCode":"000000","fixtureSessionId":"...","fixtureCwd":"..."}
 //
 // The process stays alive until its stdin closes (the test harness destroys
 // it) or it receives SIGTERM/SIGINT.
@@ -20,7 +20,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import type { AgentSessionEvent, PromptOptions, SessionManager } from "@earendil-works/pi-coding-agent";
+import { BridgeHub } from "../src/bridge.ts";
 import { createRegistry } from "../src/devices.ts";
+import { HostModeStore } from "../src/host-mode.ts";
 import { startMgmtPlane } from "../src/mgmt.ts";
 import { encodePairingText } from "../src/pairing.ts";
 import { PiRuntime, type PiSessionLike } from "../src/pi-runtime.ts";
@@ -241,6 +243,9 @@ dirs.push(fixtureCwd);
 writeFixtureSession(sessionsDir, fixtureCwd);
 
 const registry = createRegistry(join(deviceDir, "devices.json"));
+// 与生产装配一致：桥接模式与持久化都走真实代码，只把运行目录隔离到 fixture HOME。
+const hostModeStore = new HostModeStore(join(fixtureHome, "host-mode.json"));
+const bridge = new BridgeHub({ root: join(fixtureHome, "mobile-bridge"), log });
 const sessions = new Map<string, ScriptedSession>();
 const runtime = new PiRuntime({
 	agentDir: join(fixtureHome, ".pi", "agent"),
@@ -258,7 +263,12 @@ const dataPlane = await startDataPlane({
 	registry,
 	port: 0,
 	host: "127.0.0.1",
-	onClient: (send) => connectClient(runtime, send, { log: (message) => log(`[router] ${message}`) }),
+	onClient: (send) =>
+		connectClient(runtime, send, {
+			log: (message) => log(`[router] ${message}`),
+			hostModeStore,
+			bridge,
+		}),
 });
 const mgmtPlane = await startMgmtPlane({
 	registry,
@@ -280,6 +290,7 @@ process.stdout.write(
 		dataPort: dataPlane.port,
 		mgmtPort: mgmtPlane.port,
 		pairingText,
+		shortCode: pairing.shortCode,
 		fixtureSessionId: SESSION_ID,
 		fixtureCwd,
 	})}\n`,

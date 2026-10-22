@@ -214,6 +214,13 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 								"provider-model-base-url-v1",
 								"provider-test-id-v1",
 								"set-model",
+								"refresh-model",
+								"bridge-model-controls-v1",
+								"bridge-context-v1",
+								"bridge-tree-controls-v1",
+								"bridge-input-v1",
+								"bridge-workspace-v1",
+								"bridge-model-refresh-v1",
 								"directories",
 								"directory-create",
 								"workspace-create",
@@ -246,6 +253,11 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 								"attachment",
 								// 扩展通过 Pi 公开 ctx.ui.setStatus 发布的状态行（PROTOCOL §4.29）。
 								"extension-status",
+								// 桥接模式：连接已加载扩展的原生 Pi 实例（PROTOCOL §4.30+）。
+								"bridge",
+								"host-mode",
+								"host-mode-put",
+								"bridge-start",
 							]
 						: ["ping", "ping-id"]) satisfies (
 						| ClientFrameType
@@ -260,6 +272,13 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 						| "prompt-disposition-v1"
 						| "ping-id"
 						| "extension-status"
+						| "bridge"
+						| "bridge-model-controls-v1"
+						| "bridge-context-v1"
+						| "bridge-tree-controls-v1"
+						| "bridge-input-v1"
+						| "bridge-workspace-v1"
+						| "bridge-model-refresh-v1"
 					)[],
 				},
 				log,

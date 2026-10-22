@@ -1,0 +1,19 @@
+[Unit]
+Description=Pi Mobile Gateway
+
+[Service]
+# 配置与退出说明：Docs/native-service.md
+Type=exec
+WorkingDirectory=/ABS/PATH/TO/pi-mobile-gateway
+# 文件补全需要 fd/fdfind；个人安装时将其 bin 目录也加入下面的 PATH。
+Environment=PATH=/ABS/PATH/TO/NODE_DIR:/usr/local/bin:/usr/bin:/bin
+Environment=PI_MOBILE_PI_BIN=/ABS/PATH/TO/pi
+ExecStart=/ABS/PATH/TO/node /ABS/PATH/TO/pi-mobile-gateway/src/main.ts
+# 网关重启保留后台原生 Pi；停止网关后也需单独结束 Pi。
+KillMode=process
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
