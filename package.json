@@ -1,6 +1,6 @@
 {
 	"name": "pi-mobile-gateway",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"private": true,
 	"description": "让手机通过设备鉴权的 WebSocket 连接使用本机 pi：数据面 WS + localhost 管理面，配对码与设备 token 鉴权",
 	"author": "FineCat",
