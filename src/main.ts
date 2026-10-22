@@ -7,7 +7,12 @@ import { homedir, networkInterfaces } from "node:os";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
 import qrcode from "qrcode-terminal";
+import { resolveBridgeRoot } from "../bridge-extension/src/registry.ts";
+import { BridgeHub } from "./bridge.ts";
+import { BridgeLauncher } from "./bridge-launch.ts";
+import { BridgeWorkspaces } from "./bridge-workspaces.ts";
 import { createRegistry } from "./devices.ts";
+import { HostModeStore } from "./host-mode.ts";
 import { startMgmtPlane } from "./mgmt.ts";
 import { isPrivateNetworkHostname, normalizePublicUrl } from "./net-guards.ts";
 import { encodePairingText } from "./pairing.ts";
@@ -157,12 +162,25 @@ function main(): void {
 	// provider 测试状态与激活判定共用同一份存储：测试结果落盘，listModels/菜单
 	// 据此过滤（"测过且连不通"的 provider 灰显且模型不进菜单）。路径与设备注册表同目录。
 	const providerStatusStore = new ProviderStatusStore(resolve(dirname(options.deviceFile), "provider-status.json"));
+	// 连接模式与设备注册表同目录；测试用临时 device-file 即可隔离（见 host-mode 测试）。
+	const hostModeStore = new HostModeStore(resolve(dirname(options.deviceFile), "host-mode.json"));
+	const bridge = new BridgeHub({
+		root: resolveBridgeRoot(),
+		log: (message) => console.error(`[bridge] ${message}`),
+	});
+	const bridgeLauncher = new BridgeLauncher({ root: bridge.root, bridge });
 	const runtime = new PiRuntime({
 		sessionDir: options.sessionDir,
 		log: (message) => console.error(`[pi] ${message}`),
 		providerActive: (providerId) => providerStatusStore.isActive(providerId),
 	});
 
+	const bridgeWorkspaces = new BridgeWorkspaces({
+		bridge,
+		launcher: bridgeLauncher,
+		sessionDir: options.sessionDir,
+		trust: (path, trusted) => runtime.worktreeTrust(path, trusted),
+	});
 	const dataPlanePromise = startDataPlane({
 		registry,
 		port: options.dataPort,
@@ -172,6 +190,10 @@ function main(): void {
 			connectClient(runtime, send, {
 				log: (message) => console.error(`[router] ${message}`),
 				providerStatusStore,
+				hostModeStore,
+				bridge,
+				bridgeLauncher,
+				bridgeWorkspaces,
 			}),
 	});
 	const mgmtPlanePromise = startMgmtPlane({
@@ -211,6 +233,10 @@ function main(): void {
 				console.log("");
 				qrcode.generate(encodePairingText(payload), { small: true });
 				console.log("");
+				console.log(
+					`六位配对码: ${pairing.shortCode}（${new Date(pairing.shortCodeExpiresAt).toLocaleTimeString()} 过期，输错 5 次作废）`,
+				);
+				console.log(`网关地址: ${payload.publicUrl}`);
 				console.log("手动输入用文本:");
 				console.log(encodePairingText(payload));
 			}

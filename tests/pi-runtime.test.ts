@@ -2525,6 +2525,40 @@ function writeImageFixtureSession(sessionDir: string): void {
 }
 
 describe("attachment (runtime)", () => {
+	it("bridge descriptor file bypasses the SDK index and stale live manager", async () => {
+		const sessionDir = tempDir("pi-mgw-att-index-");
+		const externalDir = tempDir("pi-mgw-att-native-");
+		writeImageFixtureSession(sessionDir);
+		writeImageFixtureSession(externalDir);
+		const { runtime } = fakeRuntime({ sessionDir });
+		await runtime.openSession(SESSION_ID);
+		const externalFile = join(externalDir, `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`);
+		const data = Buffer.from("native image").toString("base64");
+		writeFileSync(externalFile, readFileSync(externalFile, "utf8").replaceAll(PNG_BASE64, data));
+		const got = await runtime.attachment(SESSION_ID, "e1", 0, externalFile);
+		assert.equal(got.dataBase64, data);
+	});
+
+	it("bridge file reads do not create SDK sessions and reject a different header", async () => {
+		const sessionDir = tempDir("pi-mgw-att-empty-");
+		const externalDir = tempDir("pi-mgw-att-outside-");
+		writeImageFixtureSession(externalDir);
+		const { runtime, sessions } = fakeRuntime({ sessionDir });
+		await runtime.listSessions(); // cache an empty SDK index before native Pi writes
+		const file = join(externalDir, `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`);
+		const got = await runtime.attachment(SESSION_ID, "e1", 0, file);
+		assert.equal(got.dataBase64, PNG_BASE64);
+		assert.equal(sessions.size, 0);
+		await assert.rejects(runtime.attachment("different-session", "e1", 0, file), SessionNotFoundError);
+		await assert.rejects(
+			runtime.attachment(SESSION_ID, "e1", 0, join(externalDir, "missing.jsonl")),
+			SessionNotFoundError,
+		);
+		await assert.rejects(runtime.attachment(SESSION_ID, "e1", 0, externalDir), SessionNotFoundError);
+		await assert.rejects(runtime.attachment(SESSION_ID, "e1", 0, "relative.jsonl"), SessionNotFoundError);
+		assert.equal(sessions.size, 0);
+	});
+
 	it("无 live 句柄：从文件视图直读，多图索引分别取回，bytes 与解码一致", async () => {
 		const sessionDir = tempDir("pi-mgw-att-");
 		writeImageFixtureSession(sessionDir);

@@ -186,7 +186,19 @@ export function createInputAssist(
 	runtime: Pick<PiRuntime, "inputCwd" | "inputResources">,
 	send: (frame: Record<string, unknown>) => void,
 	log: (message: string) => void,
-	options: { fdPath?: string; timeoutMs?: number } = {},
+	options: {
+		fdPath?: string;
+		timeoutMs?: number;
+		resolveContext?: (
+			context: InputContext,
+			frame: Record<string, unknown>,
+			signal: AbortSignal,
+		) => Promise<{
+			cwd: string;
+			readResources: () => Promise<InputResources>;
+			validate: () => void;
+		}>;
+	} = {},
 ) {
 	const active = new Map<string, AbortController>();
 	const fdPath = options.fdPath ?? findFd();
@@ -205,8 +217,14 @@ export function createInputAssist(
 				});
 				return;
 			}
+			const identity =
+				typeof frame.instanceId === "string" && typeof frame.epoch === "string"
+					? { instanceId: frame.instanceId, epoch: frame.epoch }
+					: {};
 			const errorContext =
-				typeof frame.sessionId === "string" && frame.sessionId.length <= 256 ? { sessionId: frame.sessionId } : {};
+				typeof frame.sessionId === "string" && frame.sessionId.length <= 256
+					? { sessionId: frame.sessionId, ...identity }
+					: identity;
 			let context: InputContext;
 			let token = "";
 			try {
@@ -226,8 +244,21 @@ export function createInputAssist(
 			active.get(type)?.abort();
 			const controller = new AbortController();
 			active.set(type, controller);
+			let resolved: Awaited<ReturnType<NonNullable<typeof options.resolveContext>>> | undefined;
 			const reply = (value: Record<string, unknown>) => {
-				if (!closed && active.get(type) === controller) send({ ...value, queryId });
+				if (closed || active.get(type) !== controller) return;
+				try {
+					resolved?.validate();
+				} catch (error) {
+					value = {
+						kind: "error",
+						requestType: type,
+						code: error instanceof InputAssistError ? error.code : "input-unavailable",
+						message: "input context changed",
+						...errorContext,
+					};
+				}
+				send({ ...value, ...identity, queryId });
 			};
 			const timer = setTimeout(() => {
 				controller.abort();
@@ -241,10 +272,16 @@ export function createInputAssist(
 				if (active.get(type) === controller) active.delete(type);
 			}, options.timeoutMs ?? 3000);
 			try {
-				const cwd = await runtime.inputCwd(context);
+				if (options.resolveContext) resolved = await options.resolveContext(context, frame, controller.signal);
+				else {
+					const cwd = await runtime.inputCwd(context);
+					resolved = { cwd, readResources: () => runtime.inputResources(context, cwd), validate: () => {} };
+				}
+				resolved.validate();
+				const cwd = resolved.cwd;
 				if (controller.signal.aborted) return;
-				if (type === "input-resources") {
-					const resources = await runtime.inputResources(context, cwd);
+				if (type === "input-resources" || type === "commands") {
+					const resources = await resolved.readResources();
 					if (!controller.signal.aborted) reply({ kind: type, ...context, ...resources });
 				} else {
 					const result = await completeAtToken(cwd, token, controller.signal, fdPath);
