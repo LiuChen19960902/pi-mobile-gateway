@@ -35,7 +35,6 @@ dsh 的网关做成插件，是因为 `dsh web` 本身常驻 Web 服务器，插
 | `src/pi-runtime.ts` | 会话运行时：共享 ModelRuntime、sessionId→路径索引（listAll + TTL 缓存）、活动句柄注册表（事件 seq/订阅 sink/prompt 受理串行化/空闲回收）、活动分支历史分页（首 assistant 落盘前与流式中的旧会话均补入 live 尾部条目，前缀不成立时视为陈旧不并入） |
 | `src/router.ts` | 业务帧分发：每连接订阅表、参数校验、`sent`/`history`/`state`/`subscribed` 等应答与统一 error 帧 |
 | `src/input-assist.ts` | Skills/Prompt 会话清单及不安装包的本地预览；复用 Pi TUI 公开 @ 补全，每连接取消旧 fd、超时及响应归属 |
-| `src/extension-status.ts` | 扩展 UI 只读桥：`ctx.ui.setStatus` → 会话级状态行（去 ANSI、长度/行数护栏），其余 UI 方法 no-op |
 | `src/mgmt.ts` | 管理面：localhost-only JSON API（Host/Origin/Content-Type 防护） |
 | `src/main.ts` | CLI 入口、局域网 IP 推断、终端二维码、`--session-dir` 会话目录覆盖 |
 
@@ -45,14 +44,14 @@ dsh 的网关做成插件，是因为 `dsh web` 本身常驻 Web 服务器，插
 
 - 协议版本：`1`（`hello.protocol`）。
 - 子协议：`pi-mobile-v1`；配对 `pi-pair.<code>`；token `pi-auth.<token>`；安装头 `X-Pi-Device-ID`。
-- 长期 token 与 QR/文本秘密为 256-bit、43 字符无 padding Base64URL；六位数字短码只在首次配对子协议/query 中接受，不作为长期 token。
+- 256-bit 秘密 = 43 字符无 padding Base64URL；一切凭据校验先过这个形状。
 - 设备注册表 JSON `{version:1, devices:[...]}`，存 `~/.config/pi-mobile-gateway/devices.json`（0600）。token 明文只在内存与网络中出现一次。
 - 配对载荷 `{version:1, publicUrl, pairingCode, expiresAt}`，编码为唯一规范 wire 表示（Base64URL 文本）。
 
 ## 状态与生命周期
 
 - 网关进程：SIGINT/SIGTERM → 关闭两监听面与全部 WS 连接 → 退出。
-- 配对码：长码内存 Map，加一个关联长码的短码窗口（2 分钟、共享 5 次失败预算，新签发替换旧短码）；任一领取成功同时消费长短码。短码到期仍保留长码原期限，失败耗尽则同时作废。只存摘要，签发/领取时修剪，重启全部失效。短码提高输入便利性，不能替代私网隔离，失败预算也可能被恶意耗尽。
+- 配对码：内存 Map，TTL 修剪在每次签发/领取时执行；进程重启全部失效。
 - 设备连接：upgrade 成功时 `connected()`（在线计数 +1、lastSeen 持久化），socket close 时 `disconnected()`（计数 -1，幂等）。
 - 测试注入：`createRegistry(file, { now })` 注入时钟；监听面用 `port: 0` 走临时端口。
 
@@ -106,13 +105,10 @@ dsh 的网关做成插件，是因为 `dsh web` 本身常驻 Web 服务器，插
 - `dispose()` 走 SDK `dispose()`；网关进程退出时全部释放；
 - 列表索引走 `SessionManager.listAll()` + 15s TTL；并发扫描共享同一失效代的promise，旧代结果不能回写新索引。打开已知会话可复用经文件存在和头ID核实的路径，正文仍按文件stat刷新，路径删除/身份变化重查；新建会话即失效。`sessionDir`覆盖贯穿create/open/listAll，测试用临时目录隔离。
 
-### 决策五：扩展绑定 = `bindExtensions({mode:"rpc"})` + 只读 uiContext（仅状态行）
+### 决策五：扩展绑定 = `bindExtensions({mode:"rpc"})`，无 uiContext
 
-- 与 pi 自家 RPC 模式同款绑定；网关传入自己的 `uiContext`，但只实现 Pi 公开的 `ctx.ui.setStatus(key, text)`，映射为会话级 `extension-status` 快照帧（PROTOCOL §4.29）。`setWidget`/`notify`/对话框等其余方法保持 no-op（对话框立即返回取消），避免没有完整 UI 协议时让扩展等待；
-- 动机：桌面 TUI 的子 agent、压缩、后台任务等扩展会通过 `setStatus` 发布“正在运行”的状态行；桥接这个公开原语后，手机无需逐个适配扩展包，任何遵循 Pi 扩展 UI 契约的实现都能显示状态。pi-subagents 等扩展在 RPC 模式补发 `setStatus` 即可；
-- 边界：状态是显示提示，不证明任务终态、不参与会话保活/回收，也不能替代结构化后台任务协议；完整对话框/通知/widget 交互仍需要单独设计请求、应答与取消流程，不能由普通工具事件推断；
-- 生命周期：`uiContext` 与 SDK 句柄同生共死；`subscribe`/`restart-session` 应答携带快照，`session.dispose()` 时随句柄丢弃。扩展加载/绑定失败仅记录，不致命；
-- 初始化与重载：句柄登记后仍有 `ready` 门禁，扩展绑定完成前 `openSession`/`state`/`prompt` 等入口等待，sweeper 与容量淘汰跳过初始化中的句柄；同会话 `restart-session` 串行执行，迁移订阅者后无条件广播一份完整状态快照（新扩展可能在 `session_start` 就发布状态）。
+- 与 pi 自家 RPC 模式同款调用；runner 对缺失 uiContext 有内置 `noOpUIContext` 兜底（对话框自动取消，不挂起），扩展加载失败仅记录不致命；
+- 扩展 UI 请求尚未接入手机；新增交互需要单独设计请求、应答与取消流程，不能由普通工具事件推断。
 
 ### 决策六：并发构建去重
 
@@ -194,64 +190,3 @@ message回执补充SDK输入处置及受理后状态；handled不等于运行结
 继续使用公开 `SessionManager.forkFrom` 保留完整树和 entry ID，再在活动 leaf 后追加真实模型与思考设置，使重开目标仍在同一路径。目标独立加载 cwd 的配置、AGENTS、Skills 和工具，先经原生 `ProjectTrustStore` 确认项目资源；模型或档位无法恢复则拒绝，不静默回落。源运行器保留，快照及目标初始化期间禁止源消息、模型、分支、标签、改名和重载写控制；忙、压缩或仍有队列时不搬对话。
 
 客户端随机 UUID 与宿主私有 journal 绑定同次操作。明确失败可以复用已验证副本重试，断线只查询，不重复 fork；恢复也核对模型与档位。若进程在完整 checkpoint 前中断，仍返回 unknown，不猜成功、不补写或删除副本。手机可以留在源会话继续，迟到结果不再搬动其后编辑；已知目标可从列表打开。第三方扩展的私有内存状态不承诺迁移。协议见 `PROTOCOL.md` §4.28。
-
-## 移动桥接模式（mobile-bridge，2026-10-20）
-
-目标：手机接入电脑上**正在运行**的原生 Pi，而不是只能驱动网关自己新建的 SDK 会话。网关仍是独立 Node 进程；桥接扩展是仓内独立 package `bridge-extension/`，由用户在原生 Pi 里加载，只使用公开 Extension API。
-
-- **拓扑**：Android →（既有鉴权 WebSocket）→ 网关 →（本机 Unix socket，换行分隔 JSON）→ 桥接扩展 → 原生 Pi 会话。手机协议不暴露 socket、运行目录或 IPC schema；`PROTOCOL.md` §4.30–§4.36 是唯一对外契约。
-- **模式**：`host-mode` 按宿主持久化（`host-mode.json`，与设备注册表同目录），默认 `sdk`。切换不迁移会话、不搬历史、不 Fork；运行中或有待消费队列、在途写、所有者状态未知时拒绝 `mode-switch-blocked`，避免从手机入口切断已有运行。桥接扩展不常驻、不自动加载，用户不加载时网关保持纯 SDK 行为。
-- **后台启动**：网关宣告 `bridge-start` 后，手机可对离线会话请求启动一个带桥接扩展的原生 Pi。网关用真实会话文件在宿主 tmux 中启动，等注册表出现描述符才回结果；按 `operationId` 和 `sessionId` 双重去重，超时回 `launch-result-unknown`，不假装成功。用户用 `pi-mobile attach <sessionId>` 回到该终端。
-- **发现**：扩展把描述符写到 `<PI_CODING_AGENT_DIR>/mobile-bridge/registry/`（`PI_MOBILE_BRIDGE_ROOT` 可覆盖），含 `instanceId/epoch/sessionId/pid/socketPath/owner/startedAt`。网关只读注册表 + 检查 pid 存活，不扫描进程表；socket 暂时不可达不算进程死亡。未加载扩展的原生 CLI 不在发现范围内，这是明确的产品边界。
-- **单写者**：同一会话只允许一个实例持有 owner 锁（`owners/`）；第二个加载扩展的实例降为只读。只约束加载了扩展的实例，**不宣称全宿主硬锁**：未加载扩展的 CLI 仍可写同一会话。所有写请求都要求 owner，不做最后写入者获胜。
-- **身份与去重**：每个请求带 `instanceId/epoch/sessionId`，过期或跨 epoch 一律 `stale-runtime`；`/reload` 或 `/new` 重建 epoch，旧 socket 关闭、新 epoch 重连并重发完整快照。写请求按 `operationId` 去重（同内容重试返回 `duplicate`，内容不同回 `operation-id-conflict`），覆盖手机断线重试。
-- **消息语义**：`sendUserMessage()` 返回 void，桥接只回 `submitted`，不伪造 `started/queued` 或完成；终态一律以原生事件和快照为准。忙时未指定 `steer`/`followUp` 回 `busy`（对齐 Pi 原生拒绝）。`model` 预选与从 `cwd` 新建不走 SDK 回退；模型、压缩和树操作通过各自的原生公开接口接入。
-- **队列与停止**：`dequeue` 借用公开 `CustomEditor` 的 `app.message.dequeue` 原生动作，整批取回文本；捕获期间 `getText()` 返回空、`setText()` 只记录，电脑草稿保持不变。`abort(restoreQueued:true)` 先取队列再中止，文本交给手机；否则沿用 Pi 原生 Esc 语义把队列还给电脑编辑器。SDK 只提供整批文本取回，不做逐条/排队图片的结构化恢复，也不假装逐项撤回。
-- **订阅**：`subscribe` 先回 `subscribed`，再发完整 `bridge-snapshot`，随后转发事件；网关 `event.seq` 仍按连接内会话递增，另带扩展侧 `bridgeSeq` 和 `epoch`。重连/epoch 变化后以最新快照整体替换本地状态。有限重试仍找不到实例才发 `bridge-offline`；收到后降级为只读历史，不自动切回 SDK、不重建会话。
-- **会话列表**：磁盘条目与在线实例按真实 `sessionId` 合并，无在线描述符的磁盘项显式返回 `online:false`，避免首载或重连时客户端保留 unknown 而隐藏后台启动入口；有描述符但快照暂不可读不判离线。在线项带 `source:"bridge"`、`online`、`runtime`、`running`（取快照 `busy`）；只有在线实例没有磁盘文件的条目也返回。`sdk` 模式应答保持旧形状，不新增字段。
-- **隔离与测试**：`tests/bridge.test.ts` 用假扩展 socket + 临时注册表覆盖发现、代理、错误码、host-mode、会话合并、订阅转发与写操作；`tests/bridge-launch.test.ts` 覆盖后台启动去重、并发等待、operationId 冲突与超时未知。`bridge-extension/e2e/` 用合成 Provider/工具在独立 tmux 与临时 Pi 配置下跑真实 CLI：中途接入、断线重连保留 partial、dequeue 保留电脑草稿、真实 settle、活动工具停止、回原 CLI 同 runtime、`/reload` 新 epoch、`/new` 新 sessionId；反例（丢 partial、假 abort）必须失败。该 E2E 只证明扩展与本机 IPC，不代表 Android 端、真实网络或真实模型验收。
-
-## 桥接终态的持久化边界
-
-Pi 的公开扩展 message_end 早于 SessionManager.appendMessage。桥接扩展先暂存有界 FIFO，在后续公开事件或快照读取时按原 message 引用补真正的 entryId，再按序发出；不能在回调里等待持久化，也不按正文/时间戳猜身份。settled、生命周期和队列上限为无法关联的记录提供保守收尾。常规终态与历史共享条目ID，客户端才可合并同一消息，同时保留合法同文消息。
-
-### 原生模型控制
-
-桥接模型目录与选择以原生 CLI 的公开 ExtensionContext/ExtensionAPI 为真源：会话 scope 和认证目录决定可选模型，setModel 与 setThinkingLevel 决定实际结果。IPC 只投影模型白名单，原生模型事件不原样转发含 headers 的 Model。目录查询绑定 queryId，模型写绑定 operationId，均关联 session/instance/epoch；原生目录不落入 SDK 全局缓存，离线/旧扩展不回落 SDK。切换只影响该会话，不修改全局默认，流式时沿用 Pi 后续请求生效的语义。
-
-### 桥接上下文与压缩
-
-通过公开 `ctx.getContextUsage` 与 `ctx.compact` 接入当前原生运行时，保留其压缩钩子及未知统计。压缩请求沿用实例/代际/操作去重和单写者；回调决定真正终态，busy覆盖启动期。压缩、普通生成分别投影，状态边界携带统计，避免每个文本delta扫描上下文。取消沿用原生abort/队列归还；缺终态不伪造成功。协议见PROTOCOL §4.35。
-
-
-### 原生树与会话操作
-
-树读取原生 manager 当前内存（含未落盘条目），复制使用共享的 Pi 全文语义，标签和标题由原生公开 API 追加。网关仍负责树展示投影，不另开 SDK 句柄。navigateTree 只在 ExtensionCommandContext 可用，因此桥接注册唯一内部命令，用一次性 nonce 获取新鲜 context，并等待实际完成；void sendUserMessage 不作为完成证明。运行、压缩、有待注入队列时先拒绝导航，保持队列可取回。
-
-Pi TUI 导航会给空编辑器自动回填。手机需要节点稿，但电脑可能正在输入；桥接只在无键盘输入、无额外 setText 且文本仍是本次自动回填时恢复电脑旧稿，不做跨 await 的无条件回滚。操作回执与错误均绑定 operation/session/instance/epoch，避免旧请求污染新代际。协议见 PROTOCOL §4.36。
-
-
-## 原生输入资源与调用
-
-桥接输入清单读取原生实例公开命令与合并设置，不重新运行 loader 或用网关 SDK 创建第二个会话。查询绑定 query/session/instance/epoch，候选完成时再次核对实例与模式；复用输入辅助的取消和超时。`@` 只用当前实例 cwd 与 Pi 公开补全器，不读取正文。
-
-Skill/Prompt 的正文展开与参数由同一原生 Pi 处理。只为当前存在且没有扩展同名遮蔽的资源开启 expandPromptTemplates，其他扩展命令拒绝，避免把只提供选择与调用的手机入口变成任意 TUI 命令入口。候选存在与 submitted 都不保证实际启动模型；输入处理器仍可按原生语义消费。协议见 PROTOCOL §4.37。
-
-
-## 原生工作区与新会话
-
-桥接的目录列表与 Git worktree 创建沿用只读/目录级能力，源会话级 Fork 在原生扩展的同步回调中调用公开 SessionManager.forkFrom，保留源运行器与文件；目标叶子与模型/思考设置单独持久化，再通过 tmux 启动目标原生 Pi。目标真实快照校验失败不假称成功。新空会话用 --session-id 指定 ID，避免 --session 指向不存在文件造成随机 ID。目标项目仍需显式信任。
-
-BridgeWorkspaces 使用独立操作日志，记录目标 checkpoint；未知只查询同一目标，查询不走 PiRuntime 的 SDK 恢复。源侧持久 Fork 回执在 reload 后仍防重复，复制窗口不 await。目标目录按网关 sessionDir 配置或目标 cwd 计算存储目录。首条 message 显式 nativeNew，在订阅真实快照后提交，客户端身份不由 sent 建立。SDK 原有路径不作为桥接回退。契约见 PROTOCOL §4.38；隔离真实 Pi 合成验证不替代手机与真实 Provider 验收。
-
-
-## 原生配置刷新边界
-
-Provider落盘后，手机仅刷新当前在线原生实例。扩展通过公开ModelRegistry.refresh和同名setModel，沿用模型写队列与去重；空闲门槛、刷新前后context/model/thinking校验保护晚到结果，controlPending覆盖未完成模型写。保存与运行时应用分别报告。显式refresh-model使旧扩展能拒绝，不用会被忽略的flag冒充生效。
-
-ctx.scopedModels没有公开setter，刷新目录或/reload不重算scope，因此全局scope保存仅供后续原生启动。原生setStatus没有独立公开getter/事件；获取FooterDataProvider会替换终端footer，不采用。不持有SDK句柄来绕过公开边界。PROTOCOL §4.39为契约。
-
-
-## 网关与后台原生 Pi 的服务生命周期
-
-BridgeLauncher启动的tmux/Pi继承网关cgroup，脱离终端不等于脱离systemd。可选用户服务采用KillMode=process：重启保留原生实例，停止也保留，用户通过attach结束原生Pi，不做隐式清理或后台监督框架。默认control-group与process已用独立服务、真实Launcher/Pi对照验证，测试服务与所有子进程均独立回收；正常服务不被实验修改。安装与退出见Docs/native-service.md，示例不自动部署。
