@@ -3,25 +3,15 @@
 // external network.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { connect as connectNet, createServer } from "node:net";
+import { mkdtempSync, rmSync } from "node:fs";
+import { connect as connectNet } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import WebSocket, { type ClientOptions } from "ws";
-import { BridgeHub } from "../src/bridge.ts";
 import { createRegistry, type DeviceRegistry } from "../src/devices.ts";
-import { HostModeStore } from "../src/host-mode.ts";
 import { startMgmtPlane } from "../src/mgmt.ts";
-import { PiRuntime } from "../src/pi-runtime.ts";
-import { connectClient } from "../src/router.ts";
-import {
-	type DataPlane,
-	type DataPlaneOptions,
-	MAX_SEND_BUFFER_BYTES,
-	sendFrame,
-	startDataPlane,
-} from "../src/server.ts";
+import { type DataPlane, MAX_SEND_BUFFER_BYTES, sendFrame, startDataPlane } from "../src/server.ts";
 import { CLIENT_FRAME_TYPES } from "../src/wire.ts";
 
 const dirs: string[] = [];
@@ -46,12 +36,9 @@ interface Planes {
 	mgmtUrl: (path: string) => string;
 }
 
-async function startPlanes(
-	registryOptions: { now?: () => number; pairingTtlMs?: number } = {},
-	dataOptions: Partial<Pick<DataPlaneOptions, "onClient">> = {},
-): Promise<Planes> {
+async function startPlanes(registryOptions: { now?: () => number; pairingTtlMs?: number } = {}): Promise<Planes> {
 	const registry = createRegistry(tempDeviceFile(), registryOptions);
-	const dataPlane = await startDataPlane({ registry, port: 0, host: "127.0.0.1", ...dataOptions });
+	const dataPlane = await startDataPlane({ registry, port: 0, host: "127.0.0.1" });
 	const mgmtPlane = await startMgmtPlane({
 		registry,
 		port: 0,
@@ -562,215 +549,8 @@ describe("hello capabilities advertisement", () => {
 				"provider-model-base-url-v1",
 				"provider-test-id-v1",
 				"prompt-disposition-v1",
-				"extension-status",
-				"bridge-model-controls-v1",
-				"bridge-context-v1",
-				"bridge-tree-controls-v1",
-				"bridge-input-v1",
-				"bridge-workspace-v1",
-				"bridge-model-refresh-v1",
-				"bridge",
 			].sort(),
 			"capabilities 必须与 ClientFrameType 全量一致",
 		);
 	});
-	describe("data plane: bridge mode end to end", () => {
-		it("serves a bridge snapshot, forwards events and writes through the real WebSocket boundary", async (t) => {
-			const root = mkdtempSync(join(tmpdir(), "pi-mgw-ws-bridge-"));
-			dirs.push(root);
-			mkdirSync(join(root, "registry"), { recursive: true });
-			const socketPath = join(root, "native.sock");
-			const sessionId = "99999999-8888-7777-6666-555555555555";
-			const descriptor = {
-				schema: 1,
-				extensionVersion: "0.2.0",
-				instanceId: "ws-instance",
-				epoch: "ws-epoch",
-				sessionId,
-				pid: process.pid,
-				socketPath,
-				owner: true,
-				startedAt: Date.now(),
-				cwd: root,
-				sessionFile: null,
-			};
-			let seq = 0;
-			let native: import("node:net").Socket | undefined;
-			const snapshot = () => ({
-				...descriptor,
-				seq,
-				busy: true,
-				pending: false,
-				leafId: null,
-				model: null,
-				thinkingLevel: "off",
-				editor: "unavailable",
-				partial: null,
-				tools: [],
-			});
-			const server = createServer((socket) => {
-				native = socket;
-				socket.on("error", () => {});
-				socket.write(`${JSON.stringify({ kind: "hello", snapshot: snapshot() })}\n`);
-				let buffer = "";
-				socket.on("data", (chunk: Buffer) => {
-					buffer += chunk.toString("utf8");
-					for (;;) {
-						const newline = buffer.indexOf("\n");
-						if (newline < 0) break;
-						const request = JSON.parse(buffer.slice(0, newline)) as { id: string; op: string };
-						buffer = buffer.slice(newline + 1);
-						const base = { kind: "reply", id: request.id, ok: true };
-						if (request.op === "snapshot") {
-							socket.write(`${JSON.stringify({ ...base, snapshot: snapshot() })}\n`);
-						} else if (request.op === "send") {
-							socket.write(`${JSON.stringify({ ...base, status: "submitted" })}\n`);
-						} else {
-							socket.write(`${JSON.stringify({ ...base, ok: false, code: "unsupported" })}\n`);
-						}
-					}
-				});
-			});
-			await new Promise<void>((resolve, reject) => {
-				server.once("error", reject);
-				server.listen(socketPath, resolve);
-			});
-			t.after(() => {
-				native?.destroy();
-				server.close();
-			});
-			writeFileSync(join(root, "registry", `${sessionId}.json`), `${JSON.stringify(descriptor)}\n`);
-			const bridge = new BridgeHub({ root });
-			const modeStore = new HostModeStore(join(root, "host-mode.json"));
-			modeStore.write("bridge");
-			let sdkOpenCalls = 0;
-			const runtime = Object.assign(Object.create(PiRuntime.prototype), {
-				listSessions: async () => [],
-				openSession: async () => {
-					sdkOpenCalls += 1;
-					throw new Error("no SDK session in bridge mode");
-				},
-			}) as PiRuntime;
-			const { baseUrl, registry } = await startPlanes(
-				{},
-				{
-					onClient: (send) => connectClient(runtime, send, { hostModeStore: modeStore, bridge }),
-				},
-			);
-			const pairing = registry.createPairing("桥接手机");
-			const first = await connect(baseUrl, {
-				protocols: ["pi-mobile-v1", `pi-pair.${pairing.code}`],
-				headers: { "x-pi-device-id": "install-bridge" },
-			});
-			assert.ok(first.opened);
-			t.after(() => first.ws?.close());
-			let paired: Record<string, unknown> | undefined;
-			for (let index = 0; index < 4 && !paired; index += 1) {
-				const frame = await first.nextMessage();
-				if (frame.kind === "paired") paired = frame;
-			}
-			assert.ok(paired);
-			const token = String(paired.token);
-
-			const client = await connect(baseUrl, {
-				protocols: ["pi-mobile-v1"],
-				headers: { authorization: `Bearer ${token}`, "x-pi-device-id": "install-bridge" },
-			});
-			assert.ok(client.opened);
-			t.after(() => client.ws?.close());
-			const hello = await client.nextMessage();
-			assert.equal(hello.kind, "hello");
-			client.send(JSON.stringify({ type: "host-mode-put", mode: "bridge" }));
-			assert.equal((await client.nextMessage()).mode, "bridge");
-			client.send(JSON.stringify({ type: "subscribe", sessionId }));
-			const subscribed = await client.nextMessage();
-			assert.equal(subscribed.kind, "subscribed");
-			const snap = await client.nextMessage();
-			assert.equal(snap.kind, "bridge-snapshot");
-			assert.equal(snap.busy, true);
-			assert.equal(snap.epoch, "ws-epoch");
-
-			seq += 1;
-			native?.write(
-				`${JSON.stringify({ kind: "event", instanceId: descriptor.instanceId, epoch: descriptor.epoch, sessionId, seq, event: { type: "message_update" } })}\n`,
-			);
-			const event = await client.nextMessage();
-			assert.equal(event.kind, "event");
-			assert.equal(event.bridgeSeq, seq);
-
-			client.send(
-				JSON.stringify({
-					type: "message",
-					sessionId,
-					text: "跨 WS",
-					operationId: "ws-op",
-					instanceId: descriptor.instanceId,
-					epoch: descriptor.epoch,
-				}),
-			);
-			const sent = await client.nextMessage();
-			assert.equal(sent.kind, "sent");
-			assert.equal(sent.disposition, "submitted");
-			assert.equal(sent.operationId, "ws-op");
-
-			client.send(JSON.stringify({ type: "worktree-list", queryId: "q", sessionId }));
-			const rejected = await client.nextMessage();
-			assert.equal(rejected.kind, "error");
-			assert.equal(rejected.code, "bridge-unavailable");
-			assert.equal(sdkOpenCalls, 0);
-		});
-	});
-});
-
-it("六位码走真实握手、返回长期 token、重放拒绝且 token 可重连", async () => {
-	const { mgmtUrl, baseUrl, registry } = await startPlanes();
-	const response = await fetch(mgmtUrl("/mgw/pair"), {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ name: "short-code" }),
-	});
-	assert.equal(response.status, 201);
-	const body = (await response.json()) as {
-		shortCode: string;
-		shortCodeExpiresAt: number;
-		payload: { pairingCode: string; expiresAt: number };
-	};
-	assert.match(body.shortCode, /^[0-9]{6}$/);
-	assert.match(body.payload.pairingCode, /^[A-Za-z0-9_-]{43}$/);
-	assert.ok(body.shortCodeExpiresAt <= body.payload.expiresAt);
-	const headers = { "X-Pi-Device-ID": "install-short-0001" };
-	const first = await connect(baseUrl, { headers, protocols: ["pi-mobile-v1", `pi-pair.${body.shortCode}`] });
-	assert.equal(first.opened, true);
-	const paired = await first.nextMessage();
-	assert.equal(paired.kind, "paired");
-	assert.match(paired.token as string, /^[A-Za-z0-9_-]{43}$/);
-	assert.equal(registry.authenticate(body.shortCode), undefined);
-	const replay = await connect(baseUrl, {
-		headers,
-		protocols: ["pi-mobile-v1", `pi-pair.${body.payload.pairingCode}`],
-	});
-	assert.equal(replay.status, 401);
-	first.ws?.close();
-	const again = await connect(baseUrl, { headers: { ...headers, authorization: `Bearer ${paired.token}` } });
-	assert.equal(again.opened, true);
-	again.ws?.close();
-});
-
-it("真实握手的错误短码共用预算，第五次失败不能继续配对", async () => {
-	const { registry, baseUrl } = await startPlanes();
-	const pair = registry.createPairing("short-code");
-	for (let i = 1; i <= 5; i++) {
-		const wrong = ((Number(pair.shortCode) + i) % 1_000_000).toString().padStart(6, "0");
-		const denied = await connect(baseUrl, {
-			headers: { "X-Pi-Device-ID": `install-wrong-${i}` },
-			protocols: ["pi-mobile-v1", `pi-pair.${wrong}`],
-		});
-		assert.equal(denied.status, 401);
-	}
-	const denied = await connect(baseUrl, {
-		headers: { "X-Pi-Device-ID": "install-correct" },
-		protocols: ["pi-mobile-v1", `pi-pair.${pair.shortCode}`],
-	});
-	assert.equal(denied.status, 401);
-	assert.equal(registry.count(), 0);
 });

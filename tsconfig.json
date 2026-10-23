@@ -11,5 +11,5 @@
 		"noEmit": true,
 		"types": ["node"]
 	},
-	"include": ["src/**/*.ts", "tests/**/*.ts", "bridge-extension/src/**/*.ts"]
+	"include": ["src/**/*.ts", "tests/**/*.ts"]
 }

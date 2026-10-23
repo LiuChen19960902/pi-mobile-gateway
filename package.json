@@ -1,6 +1,6 @@
 {
 	"name": "pi-mobile-gateway",
-	"version": "0.5.0",
+	"version": "0.4.0",
 	"private": true,
 	"description": "让手机通过设备鉴权的 WebSocket 连接使用本机 pi：数据面 WS + localhost 管理面，配对码与设备 token 鉴权",
 	"author": "FineCat",
@@ -21,8 +21,7 @@
 		"@earendil-works/pi-coding-agent": "1.3.0",
 		"@earendil-works/pi-tui": "1.3.0",
 		"qrcode-terminal": "0.12.0",
-		"ws": "8.21.3",
-		"@earendil-works/pi-ai": "1.3.0"
+		"ws": "8.21.3"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.5.7",
@@ -30,8 +29,5 @@
 		"@types/qrcode-terminal": "0.12.2",
 		"@types/ws": "8.18.1",
 		"typescript": "5.9.3"
-	},
-	"bin": {
-		"pi-mobile": "./bin/pi-mobile"
 	}
 }

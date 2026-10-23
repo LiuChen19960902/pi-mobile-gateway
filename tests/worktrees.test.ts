@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -323,61 +323,6 @@ test("source mutations are rejected while a continuation initializes its target"
 	}
 });
 
-test("opening a pending workspace target shares its first construction", async () => {
-	const state = root(),
-		source = root(),
-		target = root(),
-		sessionDir = join(state, "sessions");
-	const manager = SessionManager.create(source, sessionDir);
-	manager.appendMessage({ role: "user", content: "synthetic", timestamp: 1 });
-	manager.appendMessage({ role: "user", content: "flush synthetic session", timestamp: 2 });
-	let release!: () => void, started!: () => void;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const targetStarted = new Promise<void>((resolve) => {
-		started = resolve;
-	});
-	let targetBuilds = 0;
-	let clock = 0;
-	const runtime = new PiRuntime({
-		sessionDir,
-		agentDir: join(state, "agent"),
-		now: () => clock,
-		sessionFactory: async ({ sessionManager }) => {
-			if (sessionManager.getCwd() === target && ++targetBuilds === 1) {
-				started();
-				await gate;
-			}
-			return fake(sessionManager);
-		},
-	});
-	const id = randomUUID();
-	let opened = false;
-	let pending: ReturnType<PiRuntime["continueWorkspace"]> | undefined;
-	let opening: ReturnType<PiRuntime["openSession"]> | undefined;
-	try {
-		pending = runtime.continueWorkspace(id, manager.getSessionId(), target);
-		await targetStarted;
-		// 模拟初始化跨过索引TTL；新的target已落盘且可被普通open发现。
-		clock = 20_000;
-		opening = runtime.openSession(id).then((handle) => {
-			opened = true;
-			return handle;
-		});
-		await new Promise((resolve) => setTimeout(resolve, 30));
-		assert.equal(targetBuilds, 1, "worktree and openSession must share one target factory");
-		assert.equal(opened, false, "opening must wait for the target's original construction");
-		release();
-		assert.equal((await pending).status, "succeeded");
-		assert.equal((await opening).session.sessionId, id);
-	} finally {
-		release();
-		await Promise.allSettled([pending, opening]);
-		runtime.disposeAll();
-	}
-});
-
 test("an existing session with the requested UUID is never adopted or rewritten", async () => {
 	const state = root(),
 		source = root(),
@@ -605,56 +550,4 @@ test("real SDK reloads target resources and built-in read tool executes in targe
 		env: { ...process.env, HOME: p, PI_CODING_AGENT_DIR: join(p, "agent"), PI_OFFLINE: "1", PI_TELEMETRY: "0" },
 	});
 	assert.ok(out.includes("REAL_SDK_TARGET_RESOURCES_AND_TOOL_CWD_PASS"));
-});
-
-test("forked sessions preserve project trust when reopened and restarted", () => {
-	const state = root(),
-		source = root(),
-		target = root(),
-		sessionDir = join(state, "sessions"),
-		agentDir = join(state, "agent");
-	const manager = SessionManager.create(source, sessionDir);
-	manager.appendMessage({ role: "user", content: "synthetic", timestamp: 1 });
-	manager.appendMessage({ role: "user", content: "flush synthetic session", timestamp: 2 });
-	const fork = SessionManager.forkFrom(manager.getSessionFile()!, target, sessionDir);
-	const marker = join(state, "project-extension-loaded");
-	mkdirSync(join(target, ".pi", "extensions"), { recursive: true });
-	writeFileSync(
-		join(target, ".pi", "extensions", "probe.ts"),
-		`
-import { writeFileSync } from "node:fs";
-export default function (pi) {
-  writeFileSync(${JSON.stringify(marker)}, "loaded");
-  pi.on("session_start", (_event, ctx) => ctx.ui.setStatus("trust-probe", "trusted"));
-}
-`,
-	);
-	const script = `
-import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
-import { PiRuntime } from "./src/pi-runtime.ts";
-const target=${JSON.stringify(target)}, agentDir=${JSON.stringify(agentDir)}, id=${JSON.stringify(fork.getSessionId())};
-const trust=new ProjectTrustStore(agentDir);
-trust.set(target, false);
-const runtime=new PiRuntime({ agentDir, sessionDir:${JSON.stringify(sessionDir)}, enabledModelsLoader:()=>undefined });
-try {
-  await runtime.openSession(id);
-  assert.equal(existsSync(${JSON.stringify(marker)}), false, "opening must not execute an untrusted fork's project extension");
-  await runtime.restartSession(id);
-  assert.equal(existsSync(${JSON.stringify(marker)}), false, "restart must preserve project trust");
-  trust.set(target,true);
-  await runtime.restartSession(id);
-  assert.equal(existsSync(${JSON.stringify(marker)}), true);
-  assert.deepEqual(runtime.extensionStatuses(id), [{key:"trust-probe",text:"trusted"}]);
-  console.log("trusted-fork-reopen-pass");
-} finally { runtime.disposeAll(); }
-`;
-	const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
-		cwd: process.cwd(),
-		env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" },
-		encoding: "utf8",
-		timeout: 20_000,
-	});
-	assert.ok(output.includes("trusted-fork-reopen-pass"));
 });

@@ -39,7 +39,6 @@ export const CLIENT_FRAME_TYPES = [
 	"model-scope",
 	"model-scope-put",
 	"set-model",
-	"refresh-model",
 	"name",
 	"compact",
 	"directories",
@@ -64,9 +63,6 @@ export const CLIENT_FRAME_TYPES = [
 	"input-resources",
 	"input-completions",
 	"attachment",
-	"host-mode",
-	"host-mode-put",
-	"bridge-start",
 ] as const;
 
 export type ClientFrameType = (typeof CLIENT_FRAME_TYPES)[number];

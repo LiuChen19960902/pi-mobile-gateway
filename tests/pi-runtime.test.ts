@@ -306,24 +306,13 @@ class FakeSession implements PiSessionLike {
 		return { percent: 42, contextWindow: 100_000, tokens: 42_000 };
 	}
 
-	/** Test hook: delayed/scripted extension binding (initialization race tests). */
-	bindings: Record<string, unknown> | undefined;
-	onBind: ((bindings: Record<string, unknown>) => Promise<void> | void) | undefined;
-	bindExtensions(bindings: Record<string, unknown>): Promise<void> {
-		this.bindings = bindings;
-		return Promise.resolve(this.onBind?.(bindings));
-	}
-
 	dispose(): void {
 		this.disposed = true;
 	}
 }
 
 /** Build a runtime whose sessions are all scripted fakes. */
-function fakeRuntime(
-	options: Partial<ConstructorParameters<typeof PiRuntime>[0]> = {},
-	configureSession?: (session: FakeSession) => void,
-): {
+function fakeRuntime(options: Partial<ConstructorParameters<typeof PiRuntime>[0]> = {}): {
 	runtime: PiRuntime;
 	sessions: Map<string, FakeSession>;
 } {
@@ -335,7 +324,6 @@ function fakeRuntime(
 		enabledModelsLoader: options.enabledModelsLoader ?? (() => undefined),
 		sessionFactory: async ({ sessionManager }) => {
 			const session = new FakeSession(sessionManager);
-			configureSession?.(session);
 			sessions.set(session.sessionId, session);
 			return session;
 		},
@@ -673,54 +661,6 @@ describe("PiRuntime: session index", () => {
 		assert.equal(items[0].cwd, "/tmp/fake-project");
 		assert.equal(items[0].messageCount, 3);
 		assert.equal(items[0].running, false);
-	});
-
-	it("openSession/state wait for extension binding before exposing the handle", async () => {
-		const sessionDir = tempDir("pi-mgw-sessions-");
-		writeFixtureSession(sessionDir);
-		let releaseBind!: () => void;
-		let bindCalls = 0;
-		const { runtime, sessions } = fakeRuntime({ sessionDir }, (session) => {
-			session.onBind = () => {
-				bindCalls += 1;
-				return new Promise<void>((resolve) => {
-					releaseBind = resolve;
-				});
-			};
-		});
-
-		const first = runtime.openSession(SESSION_ID);
-		while (!sessions.has(SESSION_ID)) await new Promise((resolve) => setTimeout(resolve, 1));
-		let secondResolved = false;
-		const second = runtime.openSession(SESSION_ID).then((handle) => {
-			secondResolved = true;
-			return handle;
-		});
-		let stateResolved = false;
-		const state = runtime.state(SESSION_ID).then((value) => {
-			stateResolved = true;
-			return value;
-		});
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		assert.equal(secondResolved, false, "并发 openSession 必须等扩展绑定完成");
-		assert.equal(stateResolved, false, "state 必须等扩展绑定完成");
-
-		releaseBind();
-		const [left, right, stateValue] = await Promise.all([first, second, state]);
-		assert.equal(left.session, right.session);
-		assert.equal(bindCalls, 1);
-		assert.equal(stateValue.sessionId, SESSION_ID);
-	});
-
-	it("serializes concurrent restarts instead of failing with session-not-found", async () => {
-		const sessionDir = tempDir("pi-mgw-sessions-");
-		writeFixtureSession(sessionDir);
-		const { runtime } = fakeRuntime({ sessionDir });
-		await runtime.openSession(SESSION_ID);
-		const [left, right] = await Promise.all([runtime.restartSession(SESSION_ID), runtime.restartSession(SESSION_ID)]);
-		assert.equal(left.sessionId, SESSION_ID);
-		assert.equal(right.sessionId, SESSION_ID);
-		await runtime.state(SESSION_ID);
 	});
 
 	it("首条即纯图（占位空格正文）的会话不会显示为空预览", async () => {
@@ -2525,40 +2465,6 @@ function writeImageFixtureSession(sessionDir: string): void {
 }
 
 describe("attachment (runtime)", () => {
-	it("bridge descriptor file bypasses the SDK index and stale live manager", async () => {
-		const sessionDir = tempDir("pi-mgw-att-index-");
-		const externalDir = tempDir("pi-mgw-att-native-");
-		writeImageFixtureSession(sessionDir);
-		writeImageFixtureSession(externalDir);
-		const { runtime } = fakeRuntime({ sessionDir });
-		await runtime.openSession(SESSION_ID);
-		const externalFile = join(externalDir, `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`);
-		const data = Buffer.from("native image").toString("base64");
-		writeFileSync(externalFile, readFileSync(externalFile, "utf8").replaceAll(PNG_BASE64, data));
-		const got = await runtime.attachment(SESSION_ID, "e1", 0, externalFile);
-		assert.equal(got.dataBase64, data);
-	});
-
-	it("bridge file reads do not create SDK sessions and reject a different header", async () => {
-		const sessionDir = tempDir("pi-mgw-att-empty-");
-		const externalDir = tempDir("pi-mgw-att-outside-");
-		writeImageFixtureSession(externalDir);
-		const { runtime, sessions } = fakeRuntime({ sessionDir });
-		await runtime.listSessions(); // cache an empty SDK index before native Pi writes
-		const file = join(externalDir, `2026-01-01T00-00-00-000Z_${SESSION_ID}.jsonl`);
-		const got = await runtime.attachment(SESSION_ID, "e1", 0, file);
-		assert.equal(got.dataBase64, PNG_BASE64);
-		assert.equal(sessions.size, 0);
-		await assert.rejects(runtime.attachment("different-session", "e1", 0, file), SessionNotFoundError);
-		await assert.rejects(
-			runtime.attachment(SESSION_ID, "e1", 0, join(externalDir, "missing.jsonl")),
-			SessionNotFoundError,
-		);
-		await assert.rejects(runtime.attachment(SESSION_ID, "e1", 0, externalDir), SessionNotFoundError);
-		await assert.rejects(runtime.attachment(SESSION_ID, "e1", 0, "relative.jsonl"), SessionNotFoundError);
-		assert.equal(sessions.size, 0);
-	});
-
 	it("无 live 句柄：从文件视图直读，多图索引分别取回，bytes 与解码一致", async () => {
 		const sessionDir = tempDir("pi-mgw-att-");
 		writeImageFixtureSession(sessionDir);
