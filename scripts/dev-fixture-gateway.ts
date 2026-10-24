@@ -10,7 +10,7 @@
 // network.
 //
 // Machine-readable stdout contract (everything else must go to stderr):
-//   FIXTURE_READY {"dataPort":N,"mgmtPort":N,"pairingText":"...","fixtureSessionId":"...","fixtureCwd":"..."}
+//   FIXTURE_READY {"dataPort":N,"mgmtPort":N,"pairingText":"...","shortCode":"000000","fixtureSessionId":"...","fixtureCwd":"..."}
 //
 // The process stays alive until its stdin closes (the test harness destroys
 // it) or it receives SIGTERM/SIGINT.
@@ -20,7 +20,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
 import type { AgentSessionEvent, PromptOptions, SessionManager } from "@earendil-works/pi-coding-agent";
+import { BridgeHub } from "../src/bridge.ts";
 import { createRegistry } from "../src/devices.ts";
+import { HostModeStore } from "../src/host-mode.ts";
 import { startMgmtPlane } from "../src/mgmt.ts";
 import { encodePairingText } from "../src/pairing.ts";
 import { PiRuntime, type PiSessionLike } from "../src/pi-runtime.ts";
@@ -47,6 +49,8 @@ class ScriptedSession implements PiSessionLike {
 	private aborted = false;
 
 	private readonly manager: SessionManager;
+	/** bindExtensions 下发的扩展 UI 上下文（状态桥测试用）。 */
+	bindings: Record<string, unknown> | undefined;
 
 	constructor(sessionManager: SessionManager) {
 		this.manager = sessionManager;
@@ -57,6 +61,11 @@ class ScriptedSession implements PiSessionLike {
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	bindExtensions(bindings: Record<string, unknown>): Promise<void> {
+		this.bindings = bindings;
+		return Promise.resolve();
 	}
 
 	private emit(event: AgentSessionEvent): void {
@@ -88,6 +97,14 @@ class ScriptedSession implements PiSessionLike {
 		// stream to interrupt.
 		if (text === "fixture:handled") {
 			options?.preflightResult?.("handled");
+			return Promise.resolve();
+		}
+		if (text === "fixture:status") {
+			// 状态桥场景：扩展在运行期 setStatus，稍后清除；不产生 streaming 回合。
+			const uiContext = this.bindings?.uiContext as { setStatus(key: string, text?: string): void } | undefined;
+			options?.preflightResult?.("handled");
+			uiContext?.setStatus("fixture", "1 agent running");
+			this.schedule(80, () => uiContext?.setStatus("fixture", undefined));
 			return Promise.resolve();
 		}
 		options?.preflightResult?.("started");
@@ -226,6 +243,9 @@ dirs.push(fixtureCwd);
 writeFixtureSession(sessionsDir, fixtureCwd);
 
 const registry = createRegistry(join(deviceDir, "devices.json"));
+// 与生产装配一致：桥接模式与持久化都走真实代码，只把运行目录隔离到 fixture HOME。
+const hostModeStore = new HostModeStore(join(fixtureHome, "host-mode.json"));
+const bridge = new BridgeHub({ root: join(fixtureHome, "mobile-bridge"), log });
 const sessions = new Map<string, ScriptedSession>();
 const runtime = new PiRuntime({
 	agentDir: join(fixtureHome, ".pi", "agent"),
@@ -243,7 +263,12 @@ const dataPlane = await startDataPlane({
 	registry,
 	port: 0,
 	host: "127.0.0.1",
-	onClient: (send) => connectClient(runtime, send, { log: (message) => log(`[router] ${message}`) }),
+	onClient: (send) =>
+		connectClient(runtime, send, {
+			log: (message) => log(`[router] ${message}`),
+			hostModeStore,
+			bridge,
+		}),
 });
 const mgmtPlane = await startMgmtPlane({
 	registry,
@@ -265,6 +290,7 @@ process.stdout.write(
 		dataPort: dataPlane.port,
 		mgmtPort: mgmtPlane.port,
 		pairingText,
+		shortCode: pairing.shortCode,
 		fixtureSessionId: SESSION_ID,
 		fixtureCwd,
 	})}\n`,

@@ -11,12 +11,14 @@
 //   that presents the same stable installation ID replaces the token on the
 //   existing device row instead of duplicating it.
 
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 const STORE_VERSION = 1;
 const DEFAULT_PAIRING_TTL_MS = 30 * 60 * 1000;
+const SHORT_PAIRING_TTL_MS = 2 * 60 * 1000;
+const SHORT_PAIRING_MAX_FAILURES = 5;
 
 export interface StoredDevice {
 	id: string;
@@ -86,7 +88,14 @@ function publicDevice(device: StoredDevice, connections: number): PublicDevice {
 export interface DeviceRegistry {
 	list(): PublicDevice[];
 	count(): number;
-	createPairing(name: unknown): { id: string; name: string; expiresAt: number; code: string };
+	createPairing(name: unknown): {
+		id: string;
+		name: string;
+		expiresAt: number;
+		code: string;
+		shortCode: string;
+		shortCodeExpiresAt: number;
+	};
 	claimPairing(code: string, clientDeviceId: string | undefined): ClaimedPairing | undefined;
 	authenticate(token: string, clientDeviceId?: string | undefined): PublicDevice | undefined;
 	connected(deviceId: string): boolean;
@@ -103,6 +112,9 @@ export function createRegistry(file: string, options: RegistryOptions = {}): Dev
 	const now = options.now ?? Date.now;
 	let devices: StoredDevice[] = [];
 	const pairings = new Map<string, Pairing>();
+	// 一个进程只开放一个短码窗口，所有来源共用失败预算，不能靠换 IP/猜测值绕过。
+	let shortWindow: { hash: string; pairingHash: string; expiresAt: number; failures: number } | undefined;
+	let previousShortHash: string | undefined;
 	const online = new Map<string, number>();
 	const revokeHandlers: Array<(deviceId: string) => void> = [];
 
@@ -150,6 +162,7 @@ export function createRegistry(file: string, options: RegistryOptions = {}): Dev
 
 	const prunePairings = () => {
 		const current = now();
+		if (shortWindow && shortWindow.expiresAt <= current) shortWindow = undefined;
 		for (const [codeHash, pairing] of pairings) {
 			if (pairing.expiresAt <= current) pairings.delete(codeHash);
 		}
@@ -174,19 +187,42 @@ export function createRegistry(file: string, options: RegistryOptions = {}): Dev
 				name: typeof name === "string" && name.trim() !== "" ? name.trim().slice(0, 80) : "未命名设备",
 				expiresAt: now() + pairingTtlMs,
 			};
-			pairings.set(digest(code), pairing);
-			return { ...pairing, code };
+			const pairingHash = digest(code);
+			pairings.set(pairingHash, pairing);
+			let shortCode: string;
+			let shortHash: string;
+			do {
+				shortCode = randomInt(1_000_000).toString().padStart(6, "0");
+				shortHash = digest(shortCode);
+			} while (shortHash === previousShortHash);
+			previousShortHash = shortHash;
+			const shortCodeExpiresAt = Math.min(pairing.expiresAt, now() + SHORT_PAIRING_TTL_MS);
+			shortWindow = { hash: shortHash, pairingHash, expiresAt: shortCodeExpiresAt, failures: 0 };
+			return { ...pairing, code, shortCode, shortCodeExpiresAt };
 		},
 
 		claimPairing(code: string, clientDeviceId: string | undefined) {
 			prunePairings();
 			if (typeof code !== "string" || code === "") return undefined;
-			const codeHash = digest(code);
+			let codeHash = digest(code);
+			if (/^[0-9]{6}$/.test(code)) {
+				if (!shortWindow) return undefined;
+				if (!safeEqualHex(codeHash, shortWindow.hash)) {
+					shortWindow.failures += 1;
+					if (shortWindow.failures >= SHORT_PAIRING_MAX_FAILURES) {
+						pairings.delete(shortWindow.pairingHash);
+						shortWindow = undefined;
+					}
+					return undefined;
+				}
+				codeHash = shortWindow.pairingHash;
+			}
 			const pairing = pairings.get(codeHash);
 			if (!pairing) return undefined;
 			// Delete before doing any further work: claiming is single-use even if
 			// a later socket upgrade fails.
 			pairings.delete(codeHash);
+			if (shortWindow?.pairingHash === codeHash) shortWindow = undefined;
 			const token = randomBytes(32).toString("base64url");
 			let device = clientDeviceId
 				? devices.find((candidate) => candidate.clientDeviceId === clientDeviceId)

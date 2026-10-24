@@ -1,3 +1,8 @@
+import {
+	createExtensionStatusStore,
+	type ExtensionStatusEntry,
+	type ExtensionStatusStore,
+} from "./extension-status.ts";
 import { HistoryCursorError, historyTurnPage } from "./history-turns.ts";
 import { requireAbsoluteDirectory } from "./host-fs.ts";
 import {
@@ -37,7 +42,7 @@ import {
 //     mid-run ("pi runs on the machine, the phone is just a remote").
 
 import { existsSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
 	type AgentSessionEvent,
 	createAgentSession,
@@ -275,6 +280,14 @@ interface LiveHandle {
 	customEntryCursor: number;
 	/** 防止同一 tick 重复排 flush。 */
 	flushScheduled: boolean;
+	/** 扩展绑定（session_start）完成；完成前句柄不得被并发请求使用。 */
+	ready: Promise<void>;
+	/** 绑定期间标记：sweeper/cap 不回收尚未初始化的句柄。 */
+	initializing: boolean;
+	/** pi 扩展通过 ctx.ui.setStatus 发布的状态行（仅显示提示，不参与运行判定）。 */
+	extensionStatus: ExtensionStatusStore;
+	/** 状态变化合并到下一微任务，避免同步 setStatus 循环发出多份快照。 */
+	statusScheduled: boolean;
 }
 
 export interface PiRuntimeOptions {
@@ -429,6 +442,10 @@ export class PiRuntime {
 	private readonly openingLocks = new Map<string, Promise<SessionHandle>>();
 	private worktreeOperations: WorktreeOperations | undefined;
 	private readonly creatingLocks = new Map<string, Promise<SessionHandle>>();
+	/** 所有构造入口共用：普通打开不能抢先物化正在继承的目标。 */
+	private readonly buildingLocks = new Map<string, Promise<LiveHandle>>();
+	/** 同一会话的重载串行化：并发 restart 不得交错 dispose/open。 */
+	private readonly restartTails = new Map<string, Promise<void>>();
 	private sweepTimer: ReturnType<typeof setInterval> | undefined;
 
 	constructor(options: PiRuntimeOptions = {}) {
@@ -578,7 +595,9 @@ export class PiRuntime {
 			...(selection.entry?.thinkingLevel ? { thinkingLevel: selection.entry.thinkingLevel } : {}),
 			...(selection.scopedModels.length > 0 ? { scopedModels: selection.scopedModels } : {}),
 		};
-		const result = workspace
+		// 继承会话的普通重开同样核对项目资源信任；运行门禁仍由本次操作控制。
+		const useWorkspaceServices = workspace || Boolean(sessionManager.getHeader()?.parentSession);
+		const result = useWorkspaceServices
 			? await createAgentSessionFromServices({
 					...sessionOptions,
 					services: await createAgentSessionServices({
@@ -599,19 +618,23 @@ export class PiRuntime {
 			throw new WorktreeError("worktree-model-unavailable");
 		}
 		const { session } = result;
-		if (typeof session.bindExtensions === "function") {
-			try {
-				await session.bindExtensions({ mode: "rpc" });
-			} catch (error) {
-				// A failing extension must not take the session down; pi-web
-				// logs and continues with the rest of the session.
-				this.log(`bindExtensions failed for ${session.sessionId}: ${String(error)}`);
-			}
-		}
 		return session;
 	}
 
 	private async buildSession(sessionManager: SessionManager, workspace = false): Promise<LiveHandle> {
+		const id = sessionManager.getSessionId();
+		const existing = this.buildingLocks.get(id);
+		if (existing) return existing;
+		const build = this.buildSessionNow(sessionManager, workspace);
+		this.buildingLocks.set(id, build);
+		try {
+			return await build;
+		} finally {
+			if (this.buildingLocks.get(id) === build) this.buildingLocks.delete(id);
+		}
+	}
+
+	private async buildSessionNow(sessionManager: SessionManager, workspace = false): Promise<LiveHandle> {
 		const factory =
 			this.sessionFactoryOverride ?? ((options) => this.createRealSession(options.sessionManager, workspace));
 		const session = await factory({ sessionManager });
@@ -620,13 +643,16 @@ export class PiRuntime {
 		// fresh AgentSession — an orphaned one would leak forever — and reuse
 		// the registered handle.
 		const existing = this.handles.get(session.sessionId);
-		if (existing && !existing.disposed) {
-			try {
-				session.dispose();
-			} catch (error) {
-				this.log(`dispose of duplicate session ${session.sessionId} failed: ${String(error)}`);
+		if (existing) {
+			await existing.ready;
+			if (!existing.disposed) {
+				try {
+					session.dispose();
+				} catch (error) {
+					this.log(`dispose of duplicate session ${session.sessionId} failed: ${String(error)}`);
+				}
+				return existing;
 			}
-			return existing;
 		}
 		const handle: LiveHandle = {
 			session,
@@ -641,11 +667,93 @@ export class PiRuntime {
 			workspaceContinuing: workspace,
 			customEntryCursor: sessionManager.getEntries().length,
 			flushScheduled: false,
+			extensionStatus: createExtensionStatusStore(() => this.scheduleExtensionStatus(handle.session.sessionId)),
+			statusScheduled: false,
+			ready: Promise.resolve(),
+			initializing: true,
 		};
 		handle.unsubscribe = session.subscribe((event) => this.onSessionEvent(handle, event));
+		// 先登记再启动绑定：session_start 的同步段可能调用 setStatus，广播需要能
+		// 按 sessionId 找到句柄。set 与 ready 赋值之间没有 await，并发调用者不可能
+		// 在 ready 尚未赋值时拿到句柄；拿到后会 await 它直到初始化完成。
 		this.handles.set(session.sessionId, handle);
+		handle.ready = this.bindSessionExtensions(handle);
+		try {
+			await handle.ready;
+		} finally {
+			handle.initializing = false;
+		}
 		this.enforceHandleCap();
 		return handle;
+	}
+
+	/** 等待句柄的扩展绑定完成；未加载或已释放返回 undefined。 */
+	private async readyHandle(sessionId: string): Promise<LiveHandle | undefined> {
+		const handle = this.handles.get(sessionId) ?? (await this.buildingLocks.get(sessionId));
+		if (!handle) return undefined;
+		await handle.ready;
+		return handle.disposed ? undefined : handle;
+	}
+
+	/**
+	 * 绑定扩展（与 pi RPC 模式同款），并接入只读的状态桥。
+	 * 其余扩展 UI 方法保持 no-op：没有对话框协议时，让扩展拿到取消值比挂起安全。
+	 */
+	private async bindSessionExtensions(handle: LiveHandle): Promise<void> {
+		try {
+			if (typeof handle.session.bindExtensions !== "function") return;
+			await handle.session.bindExtensions({
+				mode: "rpc",
+				uiContext: handle.extensionStatus.uiContext,
+			});
+		} catch (error) {
+			// 扩展失败不能拖垮会话；后续事件照常推送。整个函数体都包在 try 内，
+			// 保证 ready 结构上不会 reject、initializing 一定能收尾。
+			this.log(`bindExtensions failed for ${handle.session.sessionId}: ${String(error)}`);
+		}
+	}
+
+	/** 扩展状态变化：合并同一 tick 的多次 setStatus，推一份完整快照。 */
+	private scheduleExtensionStatus(sessionId: string): void {
+		const handle = this.handles.get(sessionId);
+		if (!handle || handle.disposed || handle.statusScheduled) return;
+		handle.statusScheduled = true;
+		queueMicrotask(() => {
+			const current = this.handles.get(sessionId);
+			if (!current || current.disposed) return;
+			current.statusScheduled = false;
+			this.broadcastExtensionStatus(current);
+		});
+	}
+
+	private broadcastExtensionStatus(handle: LiveHandle): void {
+		const frame = this.extensionStatusFrame(handle);
+		for (const sink of handle.subscribers) {
+			try {
+				sink(frame);
+			} catch {
+				// 失效连接不影响其他订阅者；清理由 router 负责。
+			}
+		}
+	}
+
+	private extensionStatusFrame(handle: LiveHandle): Record<string, unknown> {
+		return {
+			kind: "extension-status",
+			sessionId: handle.session.sessionId,
+			statuses: handle.extensionStatus.entries(),
+		};
+	}
+
+	/**
+	 * 当前会话的扩展状态快照（订阅/重载后的初始化）。
+	 * 没有句柄或没有状态时返回空数组；空数组表示“没有已发布的状态行”，
+	 * 不表示任务一定结束（见 extension-status.ts 的语义说明）。
+	 */
+	extensionStatuses(sessionId: string): ExtensionStatusEntry[] {
+		const handle = this.handles.get(sessionId);
+		if (!handle || handle.disposed) return [];
+		return handle.extensionStatus.entries();
 	}
 
 	/** Keep the number of live handles bounded: evict the least recently
@@ -656,6 +764,7 @@ export class PiRuntime {
 		const evictable = [...this.handles.values()]
 			.filter(
 				(handle) =>
+					!handle.initializing &&
 					handle.subscribers.size === 0 &&
 					!handle.session.isStreaming &&
 					!this.isHandleCompacting(handle) &&
@@ -814,8 +923,13 @@ export class PiRuntime {
 
 	/** Load a session by id (idempotent). */
 	async openSession(sessionId: string): Promise<SessionHandle> {
+		const constructing = this.buildingLocks.get(sessionId);
+		if (constructing) return this.toPublicHandle(await constructing);
 		const existing = this.handles.get(sessionId);
-		if (existing) return this.toPublicHandle(existing);
+		if (existing) {
+			await existing.ready;
+			if (!existing.disposed) return this.toPublicHandle(existing);
+		}
 		// Concurrent openers of the same session must share one build: two
 		// parallel builds would each create an SDK AgentSession, orphaning one
 		// (never disposed, invisible to the sweeper) and leaving some
@@ -834,7 +948,10 @@ export class PiRuntime {
 	private async buildSessionOnce(sessionId: string): Promise<SessionHandle> {
 		// Another opener may have registered the handle while this one queued.
 		const existing = this.handles.get(sessionId);
-		if (existing) return this.toPublicHandle(existing);
+		if (existing) {
+			await existing.ready;
+			if (!existing.disposed) return this.toPublicHandle(existing);
+		}
 		const path = await this.resolveSessionPath(sessionId);
 		if (path === null) throw new SessionNotFoundError(sessionId);
 		const sessionManager = SessionManager.open(path, this.sessionDir);
@@ -1092,8 +1209,8 @@ export class PiRuntime {
 		images: ImageAttachment[] = [],
 		onAccepted?: (acceptance: PromptAcceptance) => void,
 	): Promise<PromptAcceptance> {
-		const live = this.handles.get(handle.session.sessionId);
-		if (!live || live.disposed) throw new Error("session handle is no longer loaded");
+		const live = await this.readyHandle(handle.session.sessionId);
+		if (!live) throw new Error("session handle is no longer loaded");
 
 		// Serialize admission only: once the preceding prompt has passed or
 		// failed preflight, the SDK atomically decides whether this
@@ -1179,7 +1296,7 @@ export class PiRuntime {
 		sessionId: string,
 		onDequeued?: (queued: string[], state: WireSessionState) => void,
 	): Promise<{ queued: string[]; state: WireSessionState }> {
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live) {
 			const state = this.stateFrom(sessionId, []);
 			onDequeued?.([], state);
@@ -1206,7 +1323,7 @@ export class PiRuntime {
 
 	/** CLI Esc clears queued text before aborting; opt-in preserves legacy clients. */
 	async abort(sessionId: string, restoreQueued = false): Promise<{ queued: string[]; state: WireSessionState }> {
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live) return { queued: [], state: this.stateFrom(sessionId, []) };
 		const previous = live.admissionTail;
 		let release!: () => void;
@@ -1644,7 +1761,7 @@ export class PiRuntime {
 		thinkingLevel?: string,
 	): Promise<WireSessionState> {
 		const handle = await this.openSession(sessionId);
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		// Touch the handle before any await so the idle sweeper cannot reclaim
@@ -1677,7 +1794,7 @@ export class PiRuntime {
 	 *  随之更新（客户端列表展示的 `displayTitle` 优先 name）。 */
 	async setSessionName(sessionId: string, name: string): Promise<WireSessionState> {
 		const handle = await this.openSession(sessionId);
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		live.lastActivity = this.now();
@@ -1699,9 +1816,29 @@ export class PiRuntime {
 	 * seq 从头计数（客户端走重连 catch-up 语义）。
 	 */
 	async restartSession(sessionId: string): Promise<WireSessionState> {
-		const existing = this.handles.get(sessionId);
+		// 并发重载必须串行：否则两路 dispose/open 会互相把对方的新句柄删掉，
+		// 出现「会话不存在」的假故障。前一次失败不阻塞下一次尝试。
+		const previous = this.restartTails.get(sessionId) ?? Promise.resolve();
+		const task = previous.then(
+			() => this.restartSessionNow(sessionId),
+			() => this.restartSessionNow(sessionId),
+		);
+		const tail = task.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.restartTails.set(sessionId, tail);
+		try {
+			return await task;
+		} finally {
+			if (this.restartTails.get(sessionId) === tail) this.restartTails.delete(sessionId);
+		}
+	}
+
+	private async restartSessionNow(sessionId: string): Promise<WireSessionState> {
+		const existing = await this.readyHandle(sessionId);
 		if (existing?.workspaceContinuing || existing?.workspaceControls) throw new WorktreeError("worktree-busy");
-		if (existing && !existing.disposed && (existing.session.isStreaming || this.isHandleCompacting(existing))) {
+		if (existing && (existing.session.isStreaming || this.isHandleCompacting(existing))) {
 			throw new SessionRestartError(sessionId);
 		}
 		const carriedSubscribers = existing ? [...existing.subscribers] : [];
@@ -1713,16 +1850,19 @@ export class PiRuntime {
 		this.manualLeafIds.delete(sessionId);
 		this.labelLeafPins.delete(sessionId);
 		await this.openSession(sessionId);
-		const live = this.handles.get(sessionId);
-		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
+		const live = await this.readyHandle(sessionId);
+		if (!live) throw new SessionNotFoundError(sessionId);
 		for (const sink of carriedSubscribers) live.subscribers.add(sink);
+		// 新扩展可能在 session_start 期间就发布状态（此时还没有订阅者），
+		// 迁移 sink 后必须无条件补一份完整快照，空状态也要发，清掉旧状态行。
+		this.broadcastExtensionStatus(live);
 		return this.liveState(sessionId, live);
 	}
 
 	/** 压缩调用从等待abort开始即占用；结束后推送最终状态，断线重连也可查询。 */
 	async beginCompact(sessionId: string): Promise<WireSessionState> {
 		const handle = await this.openSession(sessionId);
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		live.lastActivity = this.now();
@@ -1762,6 +1902,7 @@ export class PiRuntime {
 	async tree(
 		sessionId: string,
 		view?: TreeViewOptions,
+		fileOnly = false,
 	): Promise<{ leafId: string | null; nodes: WireTreeNode[]; selectedId?: string | null }> {
 		// 与 history 同一读取路径：每次重新打开会话文件投影。会话可能被其他
 		// pi 客户端（桌面 CLI）并发写入，live handle 的内存 entries 是打开时的
@@ -1774,8 +1915,10 @@ export class PiRuntime {
 		// DFS是展示顺序，不是跨分支的全局时间排序。
 		// leafId 参与投影：活跃标记（`• `）与“含活跃叶子的分支排同级最前”都在网关
 		// 算好（pi flattenTree 同样用它排序），客户端零布局逻辑。
+		if (fileOnly && sessionManager.getSessionId() !== sessionId) throw new SessionNotFoundError(sessionId);
 		const entries: SessionEntry[] = sessionManager.getEntries();
-		const leafId = this.dropStaleManualLeaf(sessionId, entries) ?? sessionManager.getLeafId();
+		// 原生离线视图只信会话文件，不能复用SDK模式保留的手动叶子。
+		const leafId = (fileOnly ? undefined : this.dropStaleManualLeaf(sessionId, entries)) ?? sessionManager.getLeafId();
 		const projected = toWireTreeNodes(sessionManager.getTree(), leafId, view);
 		const nodes = view ? projected : trimTreeNodes(projected, this.treeMaxLimit);
 		const visible = new Set(nodes.map((node) => node.id));
@@ -1816,7 +1959,7 @@ export class PiRuntime {
 	 * 命令不在 session 层，不在此列。 */
 	async listCommands(sessionId: string): Promise<WireSlashCommand[]> {
 		const handle = await this.openSession(sessionId);
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		const session = handle.session;
 		const extensions =
@@ -1902,7 +2045,7 @@ export class PiRuntime {
 		queued: string[];
 		state: WireSessionState;
 	}> {
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
 		if (this.isHandleCompacting(live)) {
@@ -1971,8 +2114,9 @@ export class PiRuntime {
 	async entryCopy(
 		sessionId: string,
 		entryId: string,
+		fileOnly = false,
 	): Promise<{ sessionId: string; entryId: string; bytes: number; text?: string; oversized?: boolean }> {
-		const entry = await this.lookupEntry(sessionId, entryId);
+		const entry = await this.lookupEntry(sessionId, entryId, fileOnly);
 		const text = entryCopyText(entry);
 		if (text === undefined) throw new EntryCopyEmptyError(entryId);
 		const bytes = Buffer.byteLength(text, "utf8");
@@ -2001,7 +2145,7 @@ export class PiRuntime {
 		labelEntryId: string;
 		leafId: string | null;
 	}> {
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (!live || live.disposed) throw new SessionNotFoundError(sessionId);
 		if (!live.sessionManager.getEntry(entryId)) throw new EntryNotFoundError(entryId);
 		if (live.workspaceContinuing) throw new WorktreeError("worktree-busy");
@@ -2017,9 +2161,9 @@ export class PiRuntime {
 	}
 
 	/** entry 查找（entry-copy 用）：live 优先，失败或未加载时回落文件视图。 */
-	private async lookupEntry(sessionId: string, entryId: string): Promise<SessionEntry> {
+	private async lookupEntry(sessionId: string, entryId: string, fileOnly = false): Promise<SessionEntry> {
 		let entry: SessionEntry | undefined;
-		const live = this.handles.get(sessionId);
+		const live = fileOnly ? undefined : await this.readyHandle(sessionId);
 		if (live && !live.disposed) {
 			try {
 				entry = live.sessionManager.getEntry(entryId);
@@ -2059,7 +2203,7 @@ export class PiRuntime {
 		const fileSessionManager = this.openSessionManager(path);
 		const fileEntries: SessionEntry[] = fileSessionManager.getEntries();
 		const readAt = performance.now();
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		// Pi 的 SessionManager 在首个 assistant 写入前会延迟创建/刷新 session
 		// 文件；这时 user 条目只存在 live handle 的内存树里。重连中的手机若只读
 		// 文件，会把刚发出的 user 消息误判成不存在。保留文件视图，同时并入 live
@@ -2104,7 +2248,7 @@ export class PiRuntime {
 			// 否则 UI 显示主线而用户消息落旧分支（reviewer Finding P2）。
 			const previousManualLeaf = this.manualLeafIds.get(sessionId);
 			this.manualLeafIds.delete(sessionId);
-			const live = this.handles.get(sessionId);
+			const live = await this.readyHandle(sessionId);
 			if (live && !live.disposed) {
 				try {
 					const value = fileSessionManager.getLeafId();
@@ -2233,7 +2377,7 @@ export class PiRuntime {
 
 	/** Cheap reconciliation poll: live state when loaded, file-derived otherwise. */
 	async state(sessionId: string): Promise<WireSessionState> {
-		const live = this.handles.get(sessionId);
+		const live = await this.readyHandle(sessionId);
 		if (live) return this.liveState(sessionId, live);
 		const path = await this.resolveSessionPath(sessionId);
 		if (path === null) throw new SessionNotFoundError(sessionId);
@@ -2285,6 +2429,8 @@ export class PiRuntime {
 	 *
 	 * 读取路径：先查同 session 的 live SessionManager（覆盖新会话尚未落盘的
 	 * 消息）；live 不存在或其中没有该 entry 时，再读该会话当前文件视图
+	 * bridge 的 sourceFile 仅来自服务端注册描述符：只认原生文件视图，跳过
+	 * 旧 SDK live，避免跨运行器读到旧图片。客户端路径不能传到此参数。
 	 * （桌面 pi 后来追加的条目，live 内存快照可能看不到；(mtime,size) 门控
 	 * 缓存对并发追加已失效自刷新）。两处都以 session 身份为归属校验。
 	 */
@@ -2292,6 +2438,8 @@ export class PiRuntime {
 		sessionId: string,
 		entryId: string,
 		imageIndex: number,
+		/** Server-owned native descriptor path; never accept this from a client frame. */
+		sourceFile?: string,
 	): Promise<{
 		sessionId: string;
 		entryId: string;
@@ -2300,8 +2448,15 @@ export class PiRuntime {
 		bytes: number;
 		dataBase64: string;
 	}> {
+		if (sourceFile !== undefined) {
+			try {
+				if (!isAbsolute(sourceFile) || !statSync(sourceFile).isFile()) throw new SessionNotFoundError(sessionId);
+			} catch {
+				throw new SessionNotFoundError(sessionId);
+			}
+		}
 		let entry: SessionEntry | undefined;
-		const live = this.handles.get(sessionId);
+		const live = sourceFile === undefined ? await this.readyHandle(sessionId) : undefined;
 		if (live && !live.disposed) {
 			try {
 				entry = live.sessionManager.getEntry(entryId);
@@ -2311,8 +2466,8 @@ export class PiRuntime {
 			}
 		}
 		if (!entry) {
-			const path = await this.resolveSessionPath(sessionId);
-			if (path === null) throw new SessionNotFoundError(sessionId);
+			const path = sourceFile ?? (await this.resolveSessionPath(sessionId));
+			if (path === null || !existsSync(path)) throw new SessionNotFoundError(sessionId);
 			const manager = this.openSessionManager(path);
 			// 文件头 id 是权威身份：陈旧索引解析到别的会话文件时按未找到处理。
 			if (manager.getSessionId() !== sessionId) throw new SessionNotFoundError(sessionId);
@@ -2383,7 +2538,7 @@ export class PiRuntime {
 	/** Dispose idle, subscriber-less handles past their grace period. */
 	sweep(): void {
 		for (const handle of this.handles.values()) {
-			if (handle.subscribers.size > 0) continue;
+			if (handle.initializing || handle.subscribers.size > 0) continue;
 			if (handle.workspaceContinuing || handle.workspaceControls) continue;
 			if (handle.session.isStreaming || this.isHandleCompacting(handle)) continue;
 			if (this.now() - handle.lastActivity < this.idleDisposeMs) continue;

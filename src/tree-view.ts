@@ -2,10 +2,7 @@ import type { PiTreeNode } from "./wire.ts";
 
 export const TREE_FILTERS = ["default", "no-tools", "user-only", "labeled-only", "all"] as const;
 
-/** 单条 entry 可复制文本的 UTF-8 字节上限（`entry-copy`，PROTOCOL §4.26）。
- * 与 §4.5 的单消息 wire 预算同量级，远低于出站 8 MiB 背压阈值。超限**不截断**：
- * 网关只回 `oversized`+`bytes`，客户端必须明确报“未复制”，不能把节选当全文。 */
-export const ENTRY_COPY_MAX_BYTES = 512 * 1024;
+export { ENTRY_COPY_MAX_BYTES, entryCopyText } from "../bridge-extension/src/entries.ts";
 
 /** 标签长度上限（`label-put`，PROTOCOL §4.27）。Pi 的 LabelInput 只 trim 不限长，
  * 这里是 wire 护栏：超限回 bad-request，不静默截断后写成另一个标签。 */
@@ -45,10 +42,12 @@ export function matchesTreeView(node: PiTreeNode, leafId: string | null, view: T
 	if (e.type === "usage") return false;
 	if (e.type === "message" && m.role === "assistant" && e.id !== leafId) {
 		const hasText =
-			typeof m.content === "string"
-				? m.content.trim().length > 0
-				: Array.isArray(m.content) &&
-					m.content.some((b) => record(b).type === "text" && String(record(b).text ?? "").trim().length > 0);
+			typeof m.treeTextPresent === "boolean"
+				? m.treeTextPresent
+				: typeof m.content === "string"
+					? m.content.trim().length > 0
+					: Array.isArray(m.content) &&
+						m.content.some((b) => record(b).type === "text" && String(record(b).text ?? "").trim().length > 0);
 		if (!hasText && (!m.stopReason || m.stopReason === "stop" || m.stopReason === "toolUse")) return false;
 	}
 	const settings = [
@@ -106,55 +105,6 @@ export function matchesTreeView(node: PiTreeNode, leafId: string | null, view: T
 		.split(/\s+/)
 		.filter(Boolean)
 		.every((token) => searchable.includes(token));
-}
-
-/** Pi `TreeList.extractFullContent`：字符串原样，数组只拼 text 块，**不截断**。
- * 复制不走任何展示层窗口：树行 `preview` 是另拍的 120 字截断，搜索窗口是
- * `getSearchableText` 的 200 字（PROTOCOL §4.18/§4.26），两者都不是复制口径。 */
-function extractFullContent(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	let result = "";
-	for (const block of content) {
-		const b = record(block);
-		if (b.type === "text") result += String(b.text ?? "");
-	}
-	return result;
-}
-
-/**
- * Pi `TreeList.getEntryCopyText`（TUI Ctrl+X / `app.message.copy`）的等价实现：
- * 当前选中 entry 的完整可复制文本，不是树行预览、不是整条分支。
- * - message + bashExecution → 命令行本身；
- * - 其余 message → 全部 text 块拼接；assistant 无正文时回落 errorMessage；
- * - custom_message → 正文；compaction / branch_summary → summary；
- * - 其他类型（label/model_change/tool 调用元数据等）→ undefined，
- *   Pi 在这种情况下提示 "Selected entry has no text to copy"，网关同样不造占位文本。
- * 与 Pi 一致：只有 trim 后非空才返回，且返回**未 trim** 的原文。
- */
-export function entryCopyText(entry: unknown): string | undefined {
-	const e = record(entry);
-	let text: string | undefined;
-	switch (e.type) {
-		case "message": {
-			const m = record(e.message);
-			if (m.role === "bashExecution") {
-				text = typeof m.command === "string" ? m.command : "";
-			} else if ("content" in m) {
-				text = extractFullContent(m.content);
-				if (!text && m.role === "assistant" && typeof m.errorMessage === "string") text = m.errorMessage;
-			}
-			break;
-		}
-		case "custom_message":
-			text = extractFullContent(e.content);
-			break;
-		case "compaction":
-		case "branch_summary":
-			text = typeof e.summary === "string" ? e.summary : undefined;
-			break;
-	}
-	return text !== undefined && text.trim() !== "" ? text : undefined;
 }
 
 /**

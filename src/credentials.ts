@@ -13,6 +13,7 @@ export type Credential = { kind: "pairing"; value: string } | { kind: "token"; v
 
 /** 256-bit base64url secret: 43 characters, no padding. */
 const SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const PAIRING_PATTERN = /^(?:[A-Za-z0-9_-]{43}|[0-9]{6})$/;
 
 export const SUBPROTOCOL = "pi-mobile-v1";
 const PAIR_PREFIX = "pi-pair.";
@@ -38,7 +39,7 @@ export function extractCredential(
 			}
 			if (protocol.startsWith(PAIR_PREFIX)) {
 				const value = protocol.slice(PAIR_PREFIX.length);
-				if (SECRET_PATTERN.test(value)) return { kind: "pairing", value };
+				if (PAIRING_PATTERN.test(value)) return { kind: "pairing", value };
 			}
 		}
 	}
@@ -46,7 +47,7 @@ export function extractCredential(
 	// Compatibility fallback: a one-time pairing code may arrive in the query.
 	// Tokens must not.
 	const pairing = query.get("pairingCode");
-	if (pairing && SECRET_PATTERN.test(pairing)) return { kind: "pairing", value: pairing };
+	if (pairing && PAIRING_PATTERN.test(pairing)) return { kind: "pairing", value: pairing };
 
 	return undefined;
 }

@@ -168,6 +168,8 @@ export function startMgmtPlane(options: MgmtPlaneOptions): Promise<MgmtPlane> {
 			sendJson(res, 201, {
 				pairingText: encodePairingText(payload),
 				payload,
+				shortCode: pairing.shortCode,
+				shortCodeExpiresAt: pairing.shortCodeExpiresAt,
 			});
 			return;
 		}
