@@ -2,7 +2,7 @@
 
 让手机通过**设备鉴权的 WebSocket** 连接并使用本机的 [pi](https://github.com/earendil-works/pi) coding agent：把 pi 的会话、实时回复和 Agent 执行轨迹带到移动端。
 
-配套 Android 客户端为 [pi-mobile-android](https://github.com/LiuChen19960902/pi-mobile-android)，版本 Android 1.1.0 ↔ gateway 0.4.0。网关使用锁定的 Pi SDK 1.3.0；终端 Pi 的安装与网关 npm 依赖独立，升级后需核对两者契约。
+配套 Android 客户端为 [pi-mobile-android](https://github.com/LiuChen19960902/pi-mobile-android)，版本 Android 1.2.0 ↔ gateway 0.5.0。网关使用锁定的 Pi SDK 1.3.0；终端 Pi 的安装与网关 npm 依赖独立，升级后需核对两者契约。
 
 ## 架构
 
@@ -11,9 +11,8 @@
     │ WebSocket（设备鉴权）
     ▼
 pi-mobile-gateway（本仓库，跑在 pi 同机）
-    │ SDK 进程内（@earendil-works/pi-coding-agent）
-    ▼
-pi coding agent（会话与模型调用发生在电脑上，手机只是遥控器）
+    ├─ 网关会话模式：进程内 Pi SDK，网关独立运行会话
+    └─ 原生 Pi 模式：桥接扩展，连接电脑上的同一个 Pi CLI 实例
 ```
 
 网关分为面向手机的数据面和仅限本机的管理面，并分别校验鉴权与来源：
@@ -31,7 +30,7 @@ cd pi-mobile-gateway
 npm ci
 ```
 
-要求：Node.js `>=22.19.0`（WSL2 环境同样适用）。文件补全需要运行网关的 `PATH` 中有 `fd`。若发行版安装为 `fdfind`，可在个人 bin 目录提供名为 `fd` 的链接并将该目录加入服务的 `PATH`；服务启动环境与交互终端可能不同。
+要求：Node.js `>=22.19.0`（WSL2 环境同样适用）。文件补全需要运行网关的 `PATH` 中有 `fd` 或 `fdfind`；支持两种名称，无需额外链接。个人目录安装时也要加入服务 PATH，服务启动环境与交互终端可能不同。
 
 ## 使用
 
@@ -47,9 +46,47 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 首次配对流程：
 
 1. 手机与电脑同一局域网，启动网关并 `--pair`；
-2. 终端出现的二维码 / 手动文本（严格无 padding Base64URL，30 分钟过期、仅可使用一次）；
-3. 手机扫码或粘贴文本建立连接，收到一次性的 `paired` 帧并保存长期 token；
+2. 终端给出网关地址、六位短码，以及二维码 / 配对文本；
+3. 手机填写地址和六位码（2 分钟内），或扫码 / 粘贴配对文本（30 分钟内），建立连接并保存 `paired` 帧的长期 token；
 4. 之后手机用 `Authorization: Bearer <token>` 重连。
+
+## 连接电脑上的原生 Pi
+
+**原生 Pi 模式为实验性功能。** 默认使用“网关会话”模式，由网关独立运行 Pi SDK。要让手机接上电脑当前的 CLI 会话，在本仓库根目录执行一次：
+
+```bash
+pi install ./bridge-extension
+```
+
+Pi 会把桥接包登记到全局配置的 `packages`，保留其他配置、扩展和已安装包；无需手动编辑 `settings.json`。不要加 `-l`，以便在其他项目里直接运行 `pi` 时也能加载。设置了 `PI_CODING_AGENT_DIR` 时，安装与日常 Pi 使用同一配置目录。
+
+完成后日常在项目目录直接运行 `pi`。已经打开的 CLI 等任务空闲后执行 `/reload`；仅切换手机的连接模式不会给电脑 CLI 加载扩展。能在抽屉看到历史文件，也不表示该进程已经在线。
+
+本地安装直接引用仓库文件，不复制代码。仓库移动前先在原位置移除包登记，移动后在新位置重新安装；如果已经移动，先用 `pi remove /旧绝对路径/pi-mobile-gateway/bridge-extension` 清理旧登记。更新仓库后，运行中的 CLI 要空闲后 `/reload`。用 `pi list` 查看登记；卸载时在本仓库根目录执行：
+
+```bash
+pi remove ./bridge-extension
+```
+
+卸载只移除包登记，不删除仓库文件；已运行的 CLI 同样需空闲后 `/reload`。安装桥接包不会启动网关服务，网关仍按前述步骤单独运行。
+
+已按旧说明在 `extensions` 中登记入口的用户可以继续原方式，无需重复安装。同一真实入口同时由两种方式登记时，Pi 会去重；但 `pi remove` 不会删除旧的手工登记。迁移时只移除该桥接入口的旧 `extensions` 项，保留其他配置，再按上述命令安装。
+
+临时排查可用 `pi -e ./bridge-extension/src/index.ts`，仅作用于本次启动，不替代安装。包机制见 [Pi 官方说明](https://pi.dev/docs/latest/packages)。
+
+Pi CLI 与本仓库扩展应使用配套版本，本仓库的验证基线为 Pi 1.3.0。
+
+手机配对后，在“设置 → 连接模式”切到“原生 Pi”，再从抽屉打开同一条会话。电脑正在执行时手机可查看进度、停止或排队；回电脑后直接在原 CLI 继续。接管电脑当前任务时 CLI 需保持运行。配套网关支持 `bridge-native-resume-v1` 时，手机向已有离线会话发送会按需启动原会话的后台 Pi；在线则复用。列表与历史读取不启动进程，未加载扩展且仍在运行的 CLI 不可据此安全接管。模式切换前先结束当前生成或压缩任务。连接模式属于该网关，不能让它同时用 SDK 和桥接实例操作同一条会话。
+
+网关与 CLI 应使用相同的配置目录和桥接运行目录。默认桥接根为 `PI_CODING_AGENT_DIR/mobile-bridge`，未设置配置目录时是 `~/.pi/agent/mobile-bridge`；自定义时两端设置相同的 `PI_MOBILE_BRIDGE_ROOT`。服务环境与交互终端环境可能不同，参见[用户服务说明](Docs/native-service.md)。
+
+手机从离线会话菜单启动或按需续聊时，宿主还需有 `tmux` 与可执行的 Pi CLI。回电脑附着这个后台实例可运行：
+
+```bash
+./bin/pi-mobile attach <sessionId>
+```
+
+在其他目录调用时使用该脚本的绝对路径；后台实例与已有桌面 CLI 是两种启动入口，附着时使用与网关相同的桥接根。停止网关不会自动结束这些后台 Pi，退出方式见[生命周期说明](Docs/native-service.md#重启与停止)。
 
 ## 数据面能力
 
@@ -77,8 +114,9 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 | `commands` | 自定义命令清单（扩展/模板/skill 三源） |
 | `input-resources` / `input-completions` | 当前工作区的 Skill/Prompt 发现与 `@` 文件/目录补全 |
 | `attachment` | 按条目按需取回历史图片（单图 ≤4 MiB，缓存优先） |
+| `extension-status` | 扩展通过 Pi 公开 `ctx.ui.setStatus` 发布的会话状态行（如“1 agent running”）；订阅/重建应答带快照，实时变化整份推送 |
 
-事件（`message_start/update/end`、`tool_execution_*`、`agent_*`、`queue_update`、`compaction_*`…）与 pi 自家 RPC 协议同词表；会话在内存中按需加载、空闲 5 分钟释放，**运行中的会话即使手机断线也跑完**。
+事件（`message_start/update/end`、`tool_execution_*`、`agent_*`、`queue_update`、`compaction_*`…）与 pi 自家 RPC 协议同词表；网关会话模式在内存中按需加载会话、空闲 5 分钟释放；原生 Pi 模式由 CLI 自身持有运行状态。**手机断线不会主动中止运行**，原生 CLI 需保持运行。
 
 ## 管理面 API（localhost）
 
@@ -94,7 +132,7 @@ npm start -- --public-url "ws://<宿主IP>:3082/ws/mobile"
 **关键性质**
 
 - 长期设备 token 256-bit 熵，**只落盘 SHA-256 摘要**，永不存明文；
-- 配对码一次性、30 分钟 TTL、只存内存，重启即作废（已配对设备不受影响）；
+- QR/文本配对码一次性、30 分钟 TTL；另提供六位手输码（2 分钟有效，同一窗口输错 5 次作废，新签发替换旧短码）。任一方式配对成功后对应长短码同时失效，只存内存，重启即作废（已配对设备不受影响）；
 - 领取即消费（claim-then-delete）：即使后续升级失败配对码也不可重放；
 - 同一安装 ID 重新配对 = 凭据轮换，不产生重复设备行；
 - token 摘要比对使用 timing-safe 比较；注册表原子写入（tmp+rename），文件 0600、目录 0700；
@@ -133,10 +171,6 @@ node scripts/smoke-verify.mjs --prompt                     # 附加一条真实�
 
 协议详见 [PROTOCOL.md](PROTOCOL.md)，设计决策详见 [DESIGN.md](DESIGN.md)。
 
-## 协作与自动检查
-
-[GitHub CI](.github/workflows/ci.yml)在Linux上执行上节的类型、lint和单测检查，单测按文件串行运行。CI使用隔离配置，不需要真实Provider密钥。提交PR时说明实际验证；协议变化需同步手机端及跨仓一致性测试。依赖更新通过PR处理，不自动合并。
-
 ## 限制
 
 - 日常验证环境为 Windows + WSL2。另在 Ubuntu 26.04.1 / x86_64 / Node.js 24.21.0（已配置 `fd`）验证过 gateway 0.3.0 的较早快照：安装、配对、Provider 配置、真实聊天、工具及历史主路径通过；最新树页动作和手动压缩未在该机复验。纯 Windows、macOS 和其他 Linux 环境未验证。
@@ -144,4 +178,11 @@ node scripts/smoke-verify.mjs --prompt                     # 附加一条真实�
 - 图片附件、模型切换、会话树导航、Provider 管理、目录浏览与输入补全已实现（见上方帧/说明表）；
 - 局域网明文 `ws://` 仅限可信网络；公网必须 `wss://` + 反向代理；
 - Provider API Key 由手机表单经 `provider-put` 写入宿主 models.json（网关盲存盲回、不做 OAuth/刷新）；
-- 扩展 UI 交互（`extension_ui_request`）由 pi 的 no-op 兜底自动取消，尚无移动端审批等价物。
+- 扩展 UI 交互只桥接 `ctx.ui.setStatus` 状态行；对话框由网关 `uiContext` 立即返回取消值兜底，通知/widget 不显示，尚无移动端审批等价物。
+
+原生 Pi 模式的模型列表来自该 CLI 的当前模型范围；手机切换该实例的模型与思考档位，不修改全局默认配置。
+
+
+### 可选的用户服务
+
+需要后台运行时可使用 [systemd 用户服务示例与生命周期说明](Docs/native-service.md)。桥接后台 Pi 可以在网关重启后保留；停止网关时也需单独结束原生 Pi。直接终端与无 systemd 的 Linux 使用方式保持不变。

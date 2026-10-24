@@ -1,0 +1,18 @@
+{
+	"name": "@finecat/pi-mobile-bridge-extension",
+	"version": "0.1.0",
+	"private": true,
+	"description": "把已加载本扩展的原生 Pi CLI 实例通过本机 Unix socket 暴露给 pi-mobile-gateway",
+	"author": "FineCat",
+	"license": "MIT",
+	"type": "module",
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "1.3.0",
+		"@earendil-works/pi-ai": "1.3.0"
+	}
+}

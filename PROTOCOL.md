@@ -32,6 +32,8 @@
 
 补充安全错误分类：`directory-permission-denied` / `directory-not-found` / `directory-not-directory` / `directory-name-invalid` / `directory-name-conflict` / `filesystem-read-only` / `storage-full` / `history-cursor-invalid` / `provider-not-found` / `provider-config-read-failed` / `provider-config-write-failed`。文案为固定短句，不含原始OS异常、目标路径、游标或凭据；未知故障仍用`internal`，客户端不能据此推断权限。旧客户端仍可按通用请求拒绝处理，旧网关的`bad-request/internal`不能被新客户端猜成细分类别。
 
+桥接模式另用：`bridge-offline`（原生实例不在线或已退出）、`bridge-unavailable`（当前请求在该模式不可用）、`mode-switch-blocked`（有运行中/待消费队列/写操作在途/owner 状态未知，拒绝切换；`reasons` 取值 `running` / `pending` / `in-flight` / `owner-unknown`）、`session-owned`（会话被另一个 Pi 实例持有）、`operation-id-conflict`（同一 operationId 复用于不同内容）、`busy`（会话运行中且未指定 steer/followUp）、`frame-too-large`（单帧超过 24 MiB IPC 上限）、`bridge-stale-runtime`（写请求携带的 instanceId/epoch 已被新实例替换）、`editor-unavailable`（桥接不持有当前编辑器或原生取回动作不存在，队列没被我们动过；不影响基础停止）、`dequeue-unconfirmed`（原生取回动作已执行但没捕获到文字，队列可能已被清空，去向未确认）。文案固定，不透出扩展或上游原始错误；`frame-too-large` 不得伪装成 `bridge-offline`。
+
 ---
 
 ## 1.5 能力通告（hello.capabilities）
@@ -52,6 +54,8 @@
 | `["…","tree","switch-branch"]` | 会话分支树与分支切换 |
 | `["…","entry-copy","label-put"]` | 树动作：整条 entry 可复制全文（Pi Ctrl+X）/ 标签写（Pi Shift+L）；同时宣告特性名 `tree-actions-v1` |
 | `["…","attachment"]` | 历史图片按需取回（按 `sessionId+entryId+imageIndex`，单图 4 MiB） |
+| `["…","extension-status"]` | 扩展通过 Pi 公开 `ctx.ui.setStatus` 发布的状态行（§4.29）；只桥接这一个显示原语 |
+| `["…","bridge","host-mode","host-mode-put","bridge-start"]` | 桥接模式：网关连接电脑上已加载桥接扩展的原生 Pi 实例（§4.30–§4.33） |
 
 上表按阶段累积描述，**数组顺序不属于契约**：客户端只做成员检测（`kind in capabilities`）。
 
@@ -71,7 +75,7 @@
 硬性规则：
 
 - 长期 token **禁止**出现在 URL query；
-- 256-bit 秘密 = 43 字符无 padding Base64URL（`[A-Za-z0-9_-]{43}`）；
+- 长期 token 与二维码/配对文本的秘密为 256-bit、43 字符无 padding Base64URL（`[A-Za-z0-9_-]{43}`）；手输短码仅接受六位 ASCII 数字（保留开头的 0），只能用于 `pi-pair.` 或配对 query，不能用于 Bearer / `pi-auth.`；
 - `X-Pi-Device-ID` 是客户端持久保存的安装级 UUID（8–128 字符，`[A-Za-z0-9._:-]`），仅用于重新配对时复用设备行，不能替代凭据；缺少该头的配对请求返回 `400`。
 
 ### 配对载荷（二维码 / 手动复制文本）
@@ -87,7 +91,9 @@
 }
 ```
 
-- 配对码 TTL 30 分钟，**仅可使用一次**，领取即消费（即使后续升级失败）；
+- 二维码/配对文本 TTL 默认 30 分钟，**仅可使用一次**，领取即消费（即使后续升级失败）；
+- 同次签发另给六位 `shortCode` 与 `shortCodeExpiresAt`（最多 2 分钟，不超过对应长码期限）。手机填写网关地址和短码，仍走相同数据面握手；管理面不向手机开放。每个网关进程只保留一个短码窗口，新签发替换旧短码。
+- 短码窗口的错误尝试在所有来源、安装 ID、猜测值之间共用计数；第 5 次错误销毁窗口及对应长码，随后正确码也不能领取。格式错误或缺安装 ID 在领取前拒绝。任一长/短码领取成功同时销毁其对应凭据；短码自然到期不延长或取消长码原期限。重签发只能由本机管理面完成；短码窗口仍可能被同网段攻击者耗尽，不能替代网络隔离。
 - 只存内存：网关重启后所有未用配对码作废（已配对设备不受影响）；
 - 客户端必须严格 Base64URL 解码（拒绝 `=` padding、标准 Base64、裸 JSON、空白）。
 
@@ -95,7 +101,7 @@
 
 | 状态 | 含义 | 客户端动作 |
 | --- | --- | --- |
-| `401` | 凭据缺失/无效/过期/已用 | 清除旧 token，进入重新配对流程 |
+| `401` | 凭据缺失/无效/过期/已用 | token 鉴权失败进入重新配对；配对码被拒绝保留旧凭据及入口，不向该目标回退发送旧 token |
 | `400` | 配对缺少 `X-Pi-Device-ID`，或请求行/URL 非法 | 升级客户端 / 检查请求 |
 | `403` | 来源地址不是回环/私网（私网含 RFC1918、100.64.0.0/10 mesh VPN、IPv6 ULA/链路本地）。来源检查基于 TCP 对端地址：端口转发/DNAT（如 Docker `-p`）与反向代理下的公网来访会呈现为私网/代理地址而被放行，因此这不是「公网不可达」的保证——勿直接发布到公网，公网走 `wss://` 反向代理 | 检查网络路径；公网需走 `wss://` 反向代理 |
 | `404` | 路径不是 `/ws/mobile` | 检查地址 |
@@ -112,6 +118,7 @@
 
 - `paired` 只发送一次；客户端必须立即把 `token` 存入系统安全存储（iOS Keychain / Android Keystore），服务端不再下发；
 - 服务端落盘的只有 token 的 SHA-256 摘要；
+- 客户端收到成功 paired 后才保存新目标地址；配对拒绝/未确认不改变旧持久入口。跨存储提交失败采用失败关闭，可能需要重配，不把旧 token 与新目标绑定。
 - 同一 `X-Pi-Device-ID` 重新配对 = token 轮换（旧 token 立即失效），设备行不重复；
 - **吊销**（管理面 revoke）会立即关闭该设备的全部在线连接，close code `4003`，reason `device revoked`。
 
@@ -177,13 +184,14 @@
 ### 4.3 `subscribe` / `unsubscribe` — 事件流订阅
 
 ```json
-{"type":"subscribe","sessionId":"<uuid>"}    → {"kind":"subscribed","sessionId":"…"}
+{"type":"subscribe","sessionId":"<uuid>"}    → {"kind":"subscribed","sessionId":"…","statuses":[…]?}
 {"type":"unsubscribe","sessionId":"<uuid>"}  → {"kind":"unsubscribed","sessionId":"…"}
 ```
 
 - `subscribe` 会按需把会话加载进网关内存（幂等；已加载则复用）；
 - 订阅按连接隔离：断线自动退订；多设备可同时订阅同一会话，收到的 `seq` 一致；
-- `unsubscribe` 幂等（未订阅也返回 `unsubscribed`）。
+- `unsubscribe` 幂等（未订阅也返回 `unsubscribed`）；
+- 宣告 `extension-status` 时，`subscribed` 可带当前扩展状态快照 `statuses`（§4.29）；未宣告的旧网关没有该字段，客户端按空处理。
 
 ### 4.4 `event` — 会话事件推送（服务端主动）
 
@@ -734,12 +742,140 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 
 首页选择只设置新会话目录；会话内“新建会话”回首页，首条消息才创建；会话内“继续”才调用继续端点。客户端在权威成功后同时更新订阅、历史、目录与草稿归属，失败或未知不清源草稿。旧网关的其他功能保持原协议。
 
+### 4.29 `extension-status` — 扩展状态行（服务端主动）
+
+```json
+{"kind":"extension-status","sessionId":"<uuid>","statuses":[
+  {"key":"subagents","text":"1 agent running"}
+]}
+```
+
+- 来源是 Pi 公开扩展 API `ctx.ui.setStatus(key, text)`（RPC 模式的官方 `extension_ui_request`/`setStatus` 语义）。网关只桥接这一种显示原语；`setWidget`、`notify`、对话框等在网关内保持 no-op，避免在没有完整 UI 协议时让扩展等待。
+- 帧是**该会话的完整快照**：每次有实际变化后重发全部 `statuses`，空数组表示清除所有状态行，不做增量合并。网关合并同一 tick 的多次 `setStatus`，按 `key` 排序；相同 key 相同文本不重发。
+- 文本护栏：去掉 ANSI 转义、把换行/制表符折成空格、trim 后截断到 200 字符；`key` trim 后最多 64 字符，超长 key 的设置和清除均忽略，不截断或改写身份；最多 16 行。空 key 忽略，空文本等价于清除该 key。
+- 初始化：`subscribe` 应答的 `subscribed.statuses`（§4.3）与 `restart-session` 的 `session-restarted.statuses` 携带当前快照。重建会话时，扩展可能在初始化（`session_start`）期间就发布状态，此时还没有订阅者；网关在迁移完订阅者后**无条件补发一份完整快照**（空状态也发，用于清掉旧状态行）。`extension-status` 帧本身不需要请求，也不占用 `event.seq`。同一会话有多条连接时，补发的快照可能先于发起连接收到的 `session-restarted` 到达；客户端以最后一份完整快照为准，重复快照幂等。
+- **语义边界**：状态是显示提示，不是任务契约。它不证明后台任务已结束，也不能用于会话保活/回收判定；扩展崩溃或忘记清除时状态可能残留。没有状态帧不代表任务一定结束；客户端不要把空快照解释为“任务完成”。
+- 能力：`extension-status`。旧客户端收到未知 `kind` 时按未知帧忽略；旧网关不发该帧、`subscribed` 也无 `statuses`。
+
+### 4.30 `host-mode` / `host-mode-put` — 宿主连接模式
+
+```json
+{"type":"host-mode"}
+→ {"kind":"host-mode","mode":"sdk|bridge","switchable":true}
+
+{"type":"host-mode-put","mode":"bridge"}
+→ {"kind":"host-mode","mode":"bridge","switchable":true,"changed":true}
+→ {"kind":"error","code":"mode-switch-blocked","requestType":"host-mode-put","reasons":["running"]}
+```
+
+- `sdk`（默认）：网关自己创建并持有 Pi 会话，§4.1–§4.29 语义不变。
+- `bridge`：网关只连接电脑上**已加载桥接扩展**的原生 Pi 实例，操作同一进程、同一 `sessionId`；网关不再为这些会话创建 SDK 句柄，也不改写会话文件。
+- 模式按宿主持久化（与设备注册表同目录的 `host-mode.json`），网关重启或手机重连后保持。切换**不迁移会话、不搬历史、不自动 Fork**；切换后在另一模式下不可见的会话仍需回到原 CLI 或原模式继续。
+- 切换前检查两侧是否有运行中的运行或待消费队列；有则拒绝并回 `mode-switch-blocked`，`reasons` 去重后取值 `running` / `pending`。只在真正空闲时允许切换，避免从手机入口切断正在进行的运行。
+- 该请求只改网关自己的模式，不安装/加载扩展、不改 Pi 全局配置。旧网关不宣告时客户端不显示模式入口。
+
+### 4.31 桥接模式帧（`bridge-snapshot` / `event` / `bridge-offline`）
+
+```json
+{"kind":"bridge-snapshot","sessionId":"…","schema":1,"extensionVersion":"0.2.0",
+ "instanceId":"…","epoch":"…","pid":1234,"bridgeSeq":42,
+ "busy":false,"pending":false,"leafId":"e9",
+ "model":{"provider":"…","modelId":"…"}|null,"thinkingLevel":"medium",
+ "editor":"bridge|unavailable","partial":null,"tools":[]}
+
+{"kind":"bridge-offline","sessionId":"…","instanceId":"…","epoch":"…",
+ "reason":"no-instance|process-exited"}
+```
+
+- `subscribe` 在 bridge 模式先回 `{"kind":"subscribed","sessionId":"…","bridge":true}`，随后发一帧**完整** `bridge-snapshot`，再发后续 `event`。重载（`/reload`）或新会话产生新 `epoch`，网关按注册表用新 epoch 重连并重发快照；客户端用最新快照整体替换本地实时状态，不能把不同 epoch 的快照与事件拼接。
+- `bridge-snapshot` 是扩展侧真值：`busy` 为当前是否有运行、`pending` 为是否有未消费队列、`partial` 为未结束的 assistant 消息（结束后 `null`）、`tools` 为进行中的工具执行（`tool_execution_start/update` 原样缓存）、`leafId` 为当前叶子。`partial` 的 text/thinking 块与 `tools` 必须进入手机会话投影；后续实时事件到达后由权威内容替换，不能只显示空占位。`editor` 只表示队列取回能力是否可用，不暴露电脑草稿内容。
+- 事件帧沿用 §4.4 形状，另带 `instanceId` / `epoch` / `bridgeSeq`。网关的 `seq` 仍按连接内会话递增；`bridgeSeq` 只在同一 epoch 内单调，可用来发现丢帧，不能跨 epoch 比较。客户端以 `instanceId+epoch` 为代际：**只有 `bridge-snapshot` 能建立新代际**；新快照到达前，旧 epoch 的迟到事件整帧丢弃，新 epoch 的事件也不先切代际。同一代际内 `bridgeSeq` 不大于已消费值视为迟到帧并丢弃。切换代际只清实时快照段，已加载的历史分页属于同一会话文件，应保留并按 entryId 去重。
+- `bridge-offline` 只在注册描述符消失或进程已退出（有限重试后）时下发，`reason="no-instance"` 表示订阅时没有在线实例。socket 暂时不可达不等于进程死亡，网关静默重连，不据此下结论。收到后该会话按只读历史处理，`message` / `abort` / `dequeue` 一律回 `bridge-offline`。
+- 在线判定只看运行目录里的注册描述符与 pid 存活，不扫描进程表；未加载桥接扩展的原生 CLI 不在发现范围内。
+
+桥接扩展的公开 `message_end` 回调发生在 Pi 持久化之前。常规 user/assistant/toolResult 终态先排入有界 FIFO，在后续公开事件或快照读取时，按原 message 对象引用从公开 SessionManager 补上真正的 `entryId`，再按原序发出；不得按正文或时间戳猜身份。`agent_settled`、生命周期收尾或队列上限会保守释放仍无法关联的记录（省略身份），不能阻塞后续终态。客户端用条目 ID 合并实时消息和历史；无身份时不删除同文独立消息。
+
+### 4.32 桥接模式下的既有帧语义
+
+| 帧 | `bridge` 模式行为 |
+| --- | --- |
+| `sessions` | 磁盘条目与在线实例按真实 `sessionId` 合并。无在线描述符的磁盘项显式带 `online:false`；描述符存在但快照暂时不可读时仍为在线，不据此开放重复启动入口。在线项带 `source:"bridge"`、`online:true`、`runtime:{instanceId,epoch,pid}`，`running` 取快照 `busy`；只有在线实例、没有磁盘文件的条目也返回，`path` 为空串（不回宿主绝对路径），`created`/`modified` 用扩展启动时间，`messageCount` 为 0。应答顶层带 `"mode":"bridge"`；`sdk` 模式保持旧形状，不带该字段。`running` 只表示扩展报告的真实运行状态。 |
+| `message` | 必须带已有 `sessionId`；不支持用 `cwd` 新建，也不支持 `model` 预选（回 `bridge-unavailable`）。消息交给原生实例的 `sendUserMessage`，应答固定为 `{"kind":"sent","disposition":"submitted","status":"submitted","operationId":"…"}`，并附受理后的 `isStreaming`/`isCompacting`、`pendingMessages`（取原生pending）及`bridgeSeq`（取原生seq）快照（形状同 `prompt-disposition-v1`），**不伪造** `started` / `queued`，也不代表完成；后续状态以事件和快照为准。`mode` 为 `prompt` 且实例忙时回 `busy`；`steer` / `followUp` 按原生排队语义投递。`operationId` 在同一实例内对重试去重，内容不同复用同一 ID 回 `operation-id-conflict`。`images` 校验与 §4.2 相同。`submitted` 确认桥接实例已调用提交入口，不保证已进入模型、队列或会话历史。客户端收到匹配的提交回执即结束本次发送等待、释放已提交原稿，不继续显示“未确认”；最终运行/失败/完成仍以 Pi 事件和快照为准。没有收到提交回执时保留原有未确认恢复路径，不自动重发，也不得按 session + 正文文本猜成功。普通 `send` 不会产生可供逐条确认的 `settled` 状态，不能等待它来关闭正常发送提示。写请求可带 `instanceId` / `epoch` 绑定目标代际，不匹配回 `bridge-stale-runtime`。 |
+| `dequeue` | 走原生队列取回动作，整批返回 `queuedText`（steering→followUp 以双换行拼接）、取回后的 `pending` 与当前 `busy`（作为 `isStreaming`）；同时用 `queued:[queuedText]` 与空 `queuedMessages` 兼容 SDK 队列形状，客户端按整体并入草稿。电脑编辑器里的草稿保持不变；`editor:"unavailable"` 时回 `editor-unavailable`（输入框被其他自定义编辑器占用、暂时无法取回），队列没被我们动过，也不因此挡住 `abort` 的基础停止；取回动作已执行却抛错且没捕获到文字时回 `dequeue-unconfirmed`——此时队列可能已被清空，客户端不得声称"没动队列"或"已取回"；该失败回执同样按 `operationId` 记住，同 ID 重试回放这次"去向未确认"，不会再次执行取回（否则会取走失败之后新排入队列的消息），而 `editor-unavailable` 表示动作未执行，重试可以正常再执行。不做逐条/图片结构化恢复。 |
+| `abort` | 停止与取回队列是两种能力：**没有待消费队列时，停止不依赖编辑器归属**，桥接未持有当前 editor（例如其他 custom editor 接管）也必须完成中止，不借此回错。`restoreQueued:true` 且桥接持有当前 editor 时先取回队列再中止，取回文本随 `aborted.queuedText`（及单元素 `queued`）返回手机，不写回电脑编辑器；有队列而桥接不持有 editor 时退回原生 abort 语义（Pi 把队列拼回电脑当前编辑器：不丢稿、不覆盖现稿、不自动重发），停止前后在同一同步调用段通过公开 `ui.getEditorText()` 核对原生回填；能精确分离出队列前缀时返回 `queuedText` 与 `queuedDisposition:"captured"`，并带 `queuedRestoredToDesktop:true` 表明电脑也保留了这份未发送草稿。原有电脑草稿从不外发，也不改写别的编辑器；读取失败或不能精确分离时不猜恢复文本，保留电脑归属提示。`restoreQueued` 非 true 时沿用 Pi 原生 Esc 语义，队列文字留给电脑编辑器，同样带 `queuedRestoredToDesktop:true`（仅有待消费队列时）。取队列的三态结论另以 `queuedDisposition` 明示：`captured`（手机已拿到文字，可能是空串；`queuedRestoredToDesktop:true` 表示电脑同时保留原生恢复稿）、`left-on-desktop`（桥接没执行取回，交给 Pi 原生 abort 拼回电脑当前编辑器）、`unknown`（取回动作抛错且没捕获到文字，队列可能已被清空）；`unknown` 时**不得**声称已留在电脑，也不能因公开计数 `hasPendingMessages()` 为 false 就降级为"什么都没发生"——该计数不覆盖 TUI 压缩队列。判定依据只有公开 API：`ctx.hasPendingMessages()` 只覆盖本轮运行的 AgentSession 队列，**不含** TUI 单独的 `compactionQueuedMessages`，所以 `left-on-desktop` 的承诺范围是"本轮运行队列"，压缩排队不在其内。ACK 不等于运行结束：按真实 `busy` 报 `isStreaming` 与 `status:"settled|timeout"`。`dequeue`/`abort` 都按 `operationId` 去重，重复请求回放第一次的回执；`dequeue` 必须先落回执再取队列，`abort` 必须先落 in-flight 回执再等待 settle，断线重试不能二次取队列或重复中止。取回动作自身抛错但已捕获到文本时按已取回处理（不丢已捕获部分），带 `queuedDisposition:"captured"`；该路径下若原生队列尚有余量，余量由 Pi 的后续语义处理，手机不重复持有，也不声明余量已恢复。`abort` 本身抛错时回 `ok:false, code:"submission-failed"`，同样带 `queuedText`/`queuedDisposition`，但 `left-on-desktop` 在失败回执上降级为 `unknown`：原生 abortHandler 没执行，队列不会被拼回电脑编辑器，客户端据三态措辞而不是按失败即"已恢复"。 |
+| `history` | 条目来自实例的当前活动分支，`beforeEntryId` 为排他游标，`limit` 默认 100、上限 400；转换、单条降损与 2 MiB 页上限同 §4.6。`latestEntryId` 取快照叶子，`isStreaming`/`model`/`thinkingLevel` 取快照，`pendingMessages` 取快照 `pending`。游标不在活动分支上回 `history-cursor-invalid`。扩展响应超过 24 MiB 时不能断开 IPC 了事，必须以同 id 回 `frame-too-large`，让手机看到稳定错误而不是 `bridge-offline`。 |
+| `operation-status` | 查询 `operationId` 的桥接写回执：`status` 为 `submitted` / `settled` / `failed` / `unknown`。扩展重启或淘汰记录后返回 `unknown`，只表示查不到，不表示没有执行；客户端应保留恢复记录并提示，不得据此重放写操作。 |
+| `state` | 由快照合成：`isStreaming=busy && !isCompacting`、`pendingMessages=pending`、`model`/`thinkingLevel` 取快照；`contextUsage` 取原生公开统计，缺失或不可用时为 `null`，`queuedMessages` 为空（结构化队列未暴露）。实例不可达时回退磁盘状态，便于只读浏览。 |
+
+- 桥接模型与思考见 §4.34，上下文与压缩见 §4.35，树与改名见 §4.36。输入辅助见 §4.37；`restart-session` 回 `bridge-unavailable`，不为它们创建 SDK 句柄；无 `sessionId` 的目录级输入预览可用。
+- 所有写操作都要求该实例是会话的 owner（单写者）。同一会话的第二个实例只能观察；非 owner 写入回 `session-owned`，不做“最后写入者获胜”。
+
+### 4.33 `bridge-start` — 后台启动原生 Pi
+
+```json
+{"type":"bridge-start","sessionId":"…","operationId":"…"}
+→ {"kind":"bridge-started","operationId":"…","sessionId":"…","instanceId":"…","epoch":"…",
+   "pid":1234,"duplicate":false,"attachHint":"pi-mobile attach …","requestType":"bridge-start"}
+→ {"kind":"error","code":"session-not-found|bridge-unavailable|bridge-start-failed|launch-result-unknown|operation-id-conflict","requestType":"bridge-start","sessionId":"…"}
+```
+
+- 只在 `bridge` 模式且网关可启动宿主进程时提供；`sdk` 模式回 `bridge-unavailable`。`sessionId` 必须是 `sessions` 中可读的磁盘会话；网关用其真实会话文件启动一个加载桥接扩展的原生 Pi，并等注册表出现描述符后才回 `bridge-started`，不解析 TUI 输出。
+- `sessionId` 与 `operationId` 都必须匹配 `[A-Za-z0-9_-]+`；`sessionId` 不满足时回 `bad-request`，不做名字替换。`operationId` 最长 128。同 ID 重试回放第一次结果；同 ID 用于不同会话回 `operation-id-conflict`。同一会话已有在线实例时直接返回 `duplicate:true`，不再启动第二个。启动超时或无法确认结果回 `launch-result-unknown`，客户端只能提示刷新，不能假定成功。
+- 网关按 `sessionId` 串行化并发启动；跨网关重启的重复启动由宿主 tmux 会话名兜底。`attachHint` 是给人看的命令提示，不是可执行路径；手机不应把它当协议字段解析。
+- 客户端只在发现 `bridge-start` 能力后显示“启动后台 Pi”入口，且只对离线会话显示。
+
+### 4.34 原生 Pi 模型与思考（bridge-model-controls-v1）
+
+桥接模式的 `models` 必须带 sessionId、instanceId、epoch、queryId，回显这四项与 groups。目录来自该原生 CLI 的 `ctx.scopedModels` 与已认证目录交集；未配置 scope 时取其全部 available。不能用网关全局 enabledModels 替代。模型行维持 §4.13 白名单字段，思考档位用 Pi 公开 getSupportedThinkingLevels；不下发地址或 headers。
+
+桥接 `set-model` 带 sessionId、instanceId、epoch、operationId、provider、modelId，可选 thinkingLevel。通过公开 ExtensionAPI.setModel/setThinkingLevel 修改该实例，回 `model-set` 与完整绑定、实际生效模型/档位及运行状态，不改全局默认。同 operationId 同内容去重，不同内容拒绝；模型写入串行。过期实例拒绝，离线与旧扩展不回落 SDK。model-not-found、model-auth-missing 分别表示目录不可用与认证缺失；调用抛错或回复丢失回 model-change-unconfirmed，只表示无法确认整次切换，客户端补拉 state，不自动重试。公开 setModel 没有取消句柄，旧代调用未结束时新代写入立即回 model-change-pending，不重置串行链并发写；稍后可显式重试。
+
+原生 model_select/thinking_level_select 事件仅传最小模型标识和档位，客户端随后请求 state 校正。原生流正在运行时，切换按 Pi 原生 API 行为作用于后续请求，不改写当前已经发往上游的请求。SDK 模式保持原 models/set-model 契约。
+
+### 4.35 原生上下文与压缩（bridge-context-v1）
+
+配套桥接扩展在完整快照上增加 `isCompacting`、`isStreaming`、`contextUsage`。`busy` 仍表示原生整体活动并覆盖手机压缩启动期；客户端不得把压缩当成普通生成。`contextUsage` 只含 `tokens`、`contextWindow`、`percent`；压缩后 tokens/percent 为 null 是合法未知，不折算为零。相同字段随压缩和模型/生成状态边界的 event 帧下发；普通文本 delta 不重算统计。旧扩展无这些字段时不宣称支持压缩。
+
+```json
+{"type":"compact","sessionId":"…","operationId":"…","instanceId":"…","epoch":"…"}
+→ {"kind":"compact-started","sessionId":"…","operationId":"…","instanceId":"…","epoch":"…",
+   "status":"submitted","isStreaming":false,"isCompacting":true,"contextUsage":null}
+```
+
+请求经原生公开 `ctx.compact`，采用该运行时已加载的压缩钩子；不创建SDK句柄、不改写会话文件。四项身份必须完整并匹配，operationId按实例去重；压缩中另一操作回 `compaction-busy`。`compact-started`只是受理及当时快照，回调同步结束时 status 也可为 settled/failed；真正终态由完成/错误回调及 compaction_end 事件表示。operation-status保留 submitted/settled/failed，失败附稳定 compaction-failed/cancelled，不传原始错误。
+
+手动压缩期间send请求明确回compaction-busy，手机保留草稿；公开sendUserMessage不支持TUI专用压缩队列，不假报已排队。取消使用已有 abort，停止等待同样接受压缩回调终态，不要求 agent_settled。abort超时时仍报告真实busy/isCompacting，不提前清空运行标志。回执丢失回 compaction-unconfirmed，不自动重试；离线或换代仅清本地等待，不能据此宣称压缩未执行。state、history、模型/消息/停止回执都保持当前压缩快照，不能固定写false。设备验收与真实Provider结果另行记录。
+
+### 4.36 原生桥接树与会话操作（bridge-tree-controls-v1）
+
+仅桥接扩展 0.5+ 支持；不为树、复制、标签、跳转或改名创建 SDK 句柄。沿用 tree/view、entry-copy、label-put、switch-branch、name 及各自应答字段；桥接请求和成功/错误应答均增加 operationId、sessionId、instanceId、epoch 四元绑定。本节的身份绑定请求针对在线实例；不匹配的代际回 bridge-stale-runtime，旧扩展回 bridge-unavailable。离线只读与明确写动作按需启动见 §4.41。SDK 模式原契约不变。
+
+树直接读取原生会话管理器的当前内存条目，含未落盘条目。筛选、搜索、折叠、prefix 和当前节点仍由网关统一投影。树 IPC 仅传展示/搜索所需字段，图片与思考全文不进入树；复制单独读取整条原文，超过 512 KiB 只回 oversized/bytes，不截断冒充全文。标签和标题经公开 setLabel/setSessionName 写回同一原生实例。桥接 session-named 仅确认名称，不携带推测的活动态或空队列来覆盖之后的原生事件。
+
+跳转通过注册的内部命令获得新鲜 ExtensionCommandContext，以 navigateTree 的实际完成或取消为终态。忙碌、压缩、有待注入队列时拒绝 busy，手机需先停止；不偷偷取走队列。重复 operationId 的同内容写操作重放回执，不重复导航或落盘。取消、失败、超时分别回 navigation-cancelled、navigation-failed、navigation-unconfirmed；超时不自动重试。公开导航仍在执行时保留实例写入闸门，并阻止模式切换，直到真实调用返回；不能把请求超时当成已取消。
+
+user/custom_message 的 editorText 仍由 Pi 的目标条目 text 块生成；assistant 仅移动叶子，不修改手机草稿。桥接保护电脑编辑器：只撤回本次导航自动填入空编辑器的内容；导航期间有键盘输入、额外 setText 或编辑器被替换时保留现稿。手机已有的草稿确认和会话归属规则保持有效。
+
+桥接0.8.2+的跳转不要求桥接拥有电脑输入框，也不要求dequeue能力。使用自有BridgeEditor时保留上述带revision校验的回填撤销；其他编辑器仅调用Pi原生导航，不抢占工厂、不读取或回传电脑草稿、不做事后恢复。Pi TUI仅在当前输入为空时填目标文本，已有稿件保留；空的非桥接编辑器可能同时保留Pi原生回填，这是明确行为。busy/队列/owner/代际及未知导航保护保持。旧扩展的editor-unavailable在跳转场景显示会话编辑器原因，不套用排队提示。
+
+
+
+### 4.37 原生输入辅助（bridge-input-v1）
+
+网关宣告 `bridge-input-v1`，配套扩展 0.6+ 通过公开 `pi.getCommands()` / `pi.getSettings()` 返回**当前原生实例已加载**的 Skill/Prompt 元数据。会话级 `input-resources` / `input-completions` 沿用 §4.24–4.25 的内容与编辑片段，另须携带 `queryId/sessionId/instanceId/epoch`；成功与错误均回显这四项，旧身份请求拒绝，执行期间切模式、离线或换代的结果不作为成功候选发送。旧扩展拒绝时不打开 SDK 会话。
+
+`commands` 在桥接模式同样要求四项绑定，返回相同已过滤的清单；SDK 模式保持 §4.21 原有行为。输入资源 `mode=session, complete=true` 仅表示本实例的有效 Skill/Prompt 候选完整，不包括第三方扩展命令或资源正文。只传名称、描述、来源及公开 scope，不传宿主资源路径。公开命令信息不含 argumentHint/disableModelInvocation，这两项省略，不伪造默认值。
+
+`enableSkillCommands` 缺省为 true，只控制 Skill 候选显示；显式 `/skill:name` 调用仍按 Pi 行为处理。扩展同名优先并遮蔽 Skill/Prompt，Skill 遮蔽同名模板，即使 Skill 候选显示被关闭也不放出该模板。手机发送当前已加载的 Skill/Prompt 时，扩展用 `sendUserMessage(...,{expandPromptTemplates:true})` 让 Pi 处理参数和展开；已知扩展命令拒绝，普通文本及未知斜杠文本不启用展开。回执仍仅为 `submitted`，不保证输入处理器未消费或模型已经启动。
+
+`@` 的 cwd 取绑定的在线实例，只调用 Pi TUI 公开补全提供器，不枚举资源正文、不读文件内容，也不为补全新建 SDK 句柄。沿用 Pi 对父目录、绝对路径及引号的行为，不宣称 cwd 是文件系统沙箱；关闭/替换/超时仍按现有独立查询 lane 取消 fd，资源查询同步关闭自己的独立 IPC 连接。无会话的目录预览保留 `complete=false`。
+
 ## 5. 管理面（localhost HTTP，不面向移动端）
 
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /mgw/status` | `{dataPort, publicUrl, devices:[...]}` |
-| `POST /mgw/pair` | body `{"name"?, "publicUrl"?}` → `201 {pairingText, payload}` |
+| `POST /mgw/pair` | body `{"name"?, "publicUrl"?}` → `201 {pairingText, payload, shortCode, shortCodeExpiresAt}` |
 | `GET /mgw/devices` | `{devices:[{id,name,createdAt,lastSeenAt,online,connections}]}` |
 | `POST /mgw/devices/:id/revoke` | 吊销设备（token 立即失效，在线连接以 `4003` 关闭） |
 
@@ -771,3 +907,55 @@ Provider公共`baseUrl`是默认值，模型级`baseUrl`可覆盖；完整路径
 - `tree-actions-v1`：树页动作接线，宣告请求 `entry-copy`（§4.26）/ `label-put`（§4.27）。两端点对应 Pi TUI 树选择器的 Ctrl+X 与 Shift+L，只覆盖这两个操作：不扩展时间快捷键、消息编辑/删除、筛选循环或其他维护命令。
 - 客户端只在发现 `tree-actions-v1` 后才发送这两类请求；旧网关上动作卡只显示“跳到此处”，复制/标签入口隐藏并提示升级网关。发布新 APK 不代表网关服务已更新。
 - `tree` / `switch-branch` / `tree-view-v1` 的既有语义不变；标签写会推进叶子这一点由 §4.27 明确，客户端不得把新 `LabelEntry` 当可见行或跳转目标。
+
+### extension-status 兼容扩展（2026-10-19）
+
+- `extension-status`：桥接 Pi 公开 `ctx.ui.setStatus` 的会话级状态行（§4.29）。宣告后 `subscribed.statuses` 与 `session-restarted.statuses` 携带快照，实时变化以 `extension-status` 帧推送。
+- 客户端只在发现该能力后渲染状态；旧网关无此能力时不显示空占位。该能力不定义任务终态，不能代替 `agent_settled`、`tool_execution_end` 或插件自己的任务结果。
+- 文本是纯显示内容（已去 ANSI），不承诺可解析结构；需要结构化的后台任务状态仍走未来的独立能力。
+
+### mobile-bridge 兼容扩展（2026-10-20）
+
+- `bridge` / `host-mode` / `host-mode-put`：网关可切换到桥接模式，连接电脑上已加载桥接扩展的原生 Pi 实例，见 §4.30–§4.33。扩展、运行目录与 IPC 属于网关与 Pi 之间的私有边界，不在手机协议内。
+- 客户端只在发现 `bridge` 后显示模式切换与在线实例；旧网关无该能力时保持纯 SDK 会话列表，不显示“在线/运行中”标记。
+- 桥接模式的 `sent` 只到 `submitted`，客户端必须等事件/快照确认终态，不能把 ACK 当完成。`bridge-offline` 只降级为只读，不自动切回 SDK 模式、不重建会话。
+- 单写者只约束加载了扩展的实例；未加载扩展的原生 CLI 不受锁保护。同一会话的所有者未确定时，客户端只应浏览，不应假设可以写入。
+
+
+### 4.38 原生会话与工作区（bridge-workspace-v1）
+
+桥接网关与扩展 0.7 支持原生会话：`worktree-list` 带 sessionId 时须带 instanceId/epoch，queryId 与完整身份原样回显；从该原生 descriptor 的 cwd 只读 Git，不创建 SDK 句柄。`worktree-continue` 须带 operationId、sessionId、instanceId、epoch、targetPath，沿用 trustProject/retry 与 worktree-operation；源原生 Pi 空闲无队列时同步 Fork 完整树、活动叶子和模型/思考档位，再启动目标 cwd 的原生 Pi，源 CLI 保留。返回值只公布操作、会话与 cwd，不下发目标私有文件路径。重复 operationId 复用副本；启动未知只查询同一目标，不再次复制。worktree-create/status 使用独立原生日志，查询不启动 SDK。
+
+新建首页首条 `message` 显式加 `nativeNew:true`、operationId、cwd（无 sessionId）；网关先检查项目信任，以 operationId 持久占位，启动 `pi --session-id` 新原生会话，订阅首份真实 bridge-snapshot 后才提交消息和 sent。快照负责建立新 instance/epoch，sent 不能建立代际。客户端只接受同 operationId 且绑定该快照身份的新会话成功回执；启动前 sessionId 缺省的错误仅按当前 operationId 结束请求，即使携带身份字段也不建立代际；启动失败/未知保留原稿，不自动重发。模型预选通过目标原生 set-model 检验后应用；无受信任项目或模型不可用时拒绝首条，不悄悄降级。已有会话可显式打开或启动；按需续聊见 §4.40，不覆盖源。
+
+
+### 4.39 原生模型配置刷新（bridge-model-refresh-v1）
+
+`refresh-model`仅在bridge模式执行，须operationId/sessionId/instanceId/epoch；成功`model-refreshed`及错误完整回显身份。原生ModelRegistry.refresh读取当前原生目录，再对同provider/modelId调用公开setModel并读回思考，不调用模型。要求源空闲无队列/压缩/导航；沿用模型写队列和去重，刷新期间context或当前model/thinking变化就拒绝覆盖；配置错误只发model-config-refresh-failed，不发原文。旧扩展不支持新op则明确不可用，不忽略flag冒充成功。
+
+手机Provider保存后为当前选中在线实例请求刷新，落盘保存与运行时应用分别报告；无选中实例不假称应用。scope-model全局enabledModels仅供后续原生启动解析，当前scope保留CLI真值和--models覆盖；公开扩展API无scope setter，refresh目录或/reload不能冒充更新。原生setStatus无公开独立getter/事件，桥接不抢footer，不拿SDK状态冒充原生接入。
+
+桥接模式的历史图片仍沿用 §4.22 三元组；在线原生实例使用本地注册描述符的 sessionFile 读取，支持 CLI 自定义 --session-dir，不信任客户端提供的文件路径。读取前核对会话头 ID，不创建 AgentSession。离线实例仍只能从网关已索引的会话文件读取。
+
+桥接 `branch-switched` 的 `queued` 与 §4.19 同为字符串数组（空队列为 `[]`）；结构化队列属于 `queuedMessages:{steering,followUp}`，二者不得混用。
+
+
+### 4.40 原生会话按需续聊（bridge-native-resume-v1）
+
+bridge模式的既有会话message可显式加nativeResume:true、sessionId、operationId；不得同时带cwd、model、nativeNew或旧instanceId/epoch。此意图允许为原SID按需启动原生Pi，在线时复用原实例；不Fork历史，不创建SDK句柄。列表、历史等读操作不触发启动。旧网关不宣告能力，SDK模式拒绝该标志。
+
+网关从自己的会话索引或在线描述符取得会话文件/cwd，先检查项目信任与owner，再以稳定派生的启动操作ID记账。启动成功后先发真实bridge-snapshot建立身份，后提交冻结message；sent带nativeResume:true，沿用原operationId与实际sessionId/instanceId/epoch，ACK不是运行完成，也不自动选择用户已离开的原会话。既有会话模型由原生--session恢复，不把新会话预选写进旧会话。
+
+启动与提交分别记日志；不保存原始待发正文/图片，只保存内容指纹及结果。同一实例/代际内相同操作和内容并发/重试复用结果，内容冲突拒绝。仅busy、compaction-busy、session-owned、runtime-offline等在原生记收据和执行前明确拒绝的情形可用同内容/同ID再次尝试；unknown及执行后失败不得借此重发。启动unknown只观察同目标；提交前持久占位，丢回执后只查原生operation-status，查不到不能推断没执行，不自动重发。native-start-unconfirmed / native-submit-unconfirmed均为结果未确认，客户端保留显式恢复入口，不按确定FAILED清理。提交恢复仍要求原实例/代际，不能把旧操作投给替换后的运行器。快照前ACK或错身份ACK不得消费发送lane。
+
+项目信任沿用两步流程：message返回worktree-trust-required后，手机独立请求worktree-trust；确认只信任该目录，再由用户重新发送，不把trustProject混入消息。启动尚未建立身份且结果未知时，可观察同SID/文件/cwd的在线owner并由真实快照首次绑定身份；身份一旦记录，不能跟随替换实例。已提交后运行器换代，旧收据不能冒充新身份确认，保留未确认并供历史核对。续聊日志带内部阶段标记，worktree-status不得把启动/提交记录提升为成功。
+
+### 4.41 离线原生会话的模型与Tree（bridge-offline-controls-v1）
+
+网关宣告`bridge-offline-controls-v1`后，bridge模式允许以下显式请求；旧在线实例绑定协议保持不变。
+
+- `models`带`nativeRead:true`、queryId、可选sessionId，不带instanceId/epoch：没有在线实例时只读宿主全局可用模型与settings启用范围；指定SID已有在线实例时，即使手机还未取得实例身份也查询该CLI实际scope，不回落全局目录。应答回显nativeRead/queryId/sessionId。全局结果仅表示下一次原生启动的候选，普通在线查询仍使用身份绑定的原生models请求。
+- `tree`/`entry-copy`带`nativeRead:true`、operationId、sessionId（复制另带entryId），不带实例身份：从原会话文件只读投影，回显nativeRead及关联字段。读取不启动Pi、不建立SDK AgentSession，不执行项目资源；筛选、搜索、复制全文预算沿用原契约。
+- `set-model`/`label-put`/`switch-branch`/`name`可带`nativeResume:true`、operationId、sessionId，不带实例身份：这是明确写意图。网关按§4.40的项目信任、owner与原SID/文件/cwd启动日志复用或启动原生Pi，先订阅真实快照建立instance/epoch，再执行原生动作。成功及启动后错误回显实际完整身份；启动前错误只回显SID/operationId。客户端不把ACK当成建立代际，也不自动重发未知写入；信任确认后由用户重试原操作。并发启动/写期间禁止切模式。
+
+只读查询不冒充原生在线scope；模型的认证、可用性、思考档位及忙时拒绝仍由实际原生实例校验。首页预选随首条消息应用，已有会话选择模型通过上述明确写动作立即应用，不把新会话预选串入旧会话。SDK模式拒绝这些显式原生标志。

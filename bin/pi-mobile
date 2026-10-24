@@ -1,0 +1,17 @@
+#!/bin/sh
+# 附着到网关启动的后台 Pi。tmux socket 与注册表共用 bridge root。
+set -eu
+root=${PI_MOBILE_BRIDGE_ROOT:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/mobile-bridge}
+case "${1:-}" in
+  attach)
+    [ $# -ge 2 ] || { echo "用法: pi-mobile attach <sessionId>" >&2; exit 2; }
+    case "$2" in
+      *[!A-Za-z0-9_-]*|'') echo "sessionId 格式无效" >&2; exit 2 ;;
+    esac
+    exec tmux -S "$root/tmux.sock" attach-session -t "pi-mobile-$2"
+    ;;
+  *)
+    echo "用法: pi-mobile attach <sessionId>" >&2
+    exit 2
+    ;;
+esac
