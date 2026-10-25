@@ -3,6 +3,7 @@
 // Starts both listeners and prints where to reach them. Use --pair <name> to
 // mint a pairing code at startup and render its QR in the terminal.
 
+import "./http-runtime.ts";
 import { homedir, networkInterfaces } from "node:os";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
