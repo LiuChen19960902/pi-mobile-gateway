@@ -33,6 +33,11 @@
 - 纯图消息（`text` 为空 + `images` 非空）不再被 “message requires non-empty text” 拒绝。
 - CLI 启动校验 `--public-url` 复用 `normalizePublicUrl`（配对不再签发被管理面拒绝的公网明文地址）；仅检测到公网网卡且未请求配对时按回环入口正常启动，不再误拒。
 
+## [0.5.2] - 2026-10-25
+
+- 通过根 npm overrides 将 undici 覆盖到 8.12.2，修复异常 Content-Encoding 进程退出、EventSource 状态增长及 SRI 大小写绕过三项依赖漏洞；Pi SDK 版本与协议保持。
+- 启动时接入补丁版全局 HTTP 实现，避免实际请求仍使用 Node 内置旧 fetch；低资源回归覆盖库与启动路径、普通安装和仅生产安装。Android 继续兼容 1.2.2，无需更换 APK。
+
 ## [0.5.1] - 2026-10-25
 
 - 新增 `session-presence-v1`：列表请求可核验客户端已知会话路径，并通过 `deletedSessionIds` 显式确认闲置会话已从宿主删除。

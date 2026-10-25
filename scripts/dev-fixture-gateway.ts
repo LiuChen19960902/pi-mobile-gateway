@@ -15,6 +15,7 @@
 // The process stays alive until its stdin closes (the test harness destroys
 // it) or it receives SIGTERM/SIGINT.
 
+import "../src/http-runtime.ts";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
