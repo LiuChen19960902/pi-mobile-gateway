@@ -8,10 +8,12 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
 	appendFileSync,
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	utimesSync,
@@ -512,6 +514,171 @@ describe("selectInitialScopedModel", () => {
 });
 
 describe("history index work", () => {
+	it("a directory with a JSONL suffix is not a session file", async () => {
+		const sessionDir = tempDir("pi-mgw-presence-directory-");
+		mkdirSync(join(sessionDir, "not-a-file.jsonl"));
+		const { runtime } = fakeRuntime({ sessionDir });
+		assert.deepEqual(
+			(await runtime.listSessionsWithPresence([{ id: "deleted-with-directory", path: join(sessionDir, "old.jsonl") }]))
+				.deletedSessionIds,
+			["deleted-with-directory"],
+		);
+	});
+
+	it("unrelated JSONL logs do not block deletion confirmations", async () => {
+		const sessionDir = tempDir("pi-mgw-presence-logs-");
+		const path = join(sessionDir, "deleted.jsonl");
+		writeFileSync(
+			path,
+			`${JSON.stringify({ type: "session", version: 3, id: "deleted-with-logs", timestamp: "2026-10-01T00:00:00Z", cwd: sessionDir })}\n`,
+		);
+		const { runtime } = fakeRuntime({ sessionDir });
+		await runtime.listSessions();
+		rmSync(path);
+		writeFileSync(
+			join(sessionDir, "events.jsonl"),
+			`${JSON.stringify({ event: "synthetic-log", details: "not a Pi session" })}\n`,
+		);
+		writeFileSync(
+			join(sessionDir, "status.jsonl"),
+			`${JSON.stringify({ type: "status", state: "ready" })}\n${JSON.stringify({ type: "status", state: "done" })}\n`,
+		);
+		const result = await runtime.listSessionsWithPresence([{ id: "deleted-with-logs", path }]);
+		assert.deepEqual(result.deletedSessionIds, ["deleted-with-logs"]);
+		assert.deepEqual(result.items, []);
+	});
+
+	it("a Pi session header skipped by SDK parsing still blocks deletion confirmation", async () => {
+		const sessionDir = tempDir("pi-mgw-presence-header-");
+		const path = join(sessionDir, "old.jsonl");
+		// 身份仍在，但消息格式损坏使 SDK listAll 跳过它；不能把它当成普通日志。
+		writeFileSync(
+			join(sessionDir, "moved.jsonl"),
+			[
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "moved-damaged",
+					timestamp: "2026-10-01T00:00:00Z",
+					cwd: sessionDir,
+				}),
+				JSON.stringify({ type: "message", id: "entry", parentId: null, message: { role: "user", content: 42 } }),
+			].join("\n") + "\n",
+		);
+		const { runtime } = fakeRuntime({ sessionDir });
+		assert.deepEqual(await runtime.listSessions(), []);
+		assert.deepEqual((await runtime.listSessionsWithPresence([{ id: "moved-damaged", path }])).deletedSessionIds, []);
+	});
+
+	it("a bounded prefix cannot classify an incomplete first record as a foreign log", async () => {
+		const sessionDir = tempDir("pi-mgw-presence-prefix-");
+		const prefix = JSON.stringify({ event: "synthetic-prefix" }).padEnd(64 * 1024, " ");
+		writeFileSync(
+			join(sessionDir, "ambiguous.jsonl"),
+			[
+				`${prefix}invalid`,
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "ambiguous",
+					timestamp: "2026-10-01T00:00:00Z",
+					cwd: sessionDir,
+				}),
+				JSON.stringify({ type: "message", id: "entry", parentId: null, message: { role: "user", content: 42 } }),
+			].join("\n"),
+		);
+		const { runtime } = fakeRuntime({ sessionDir });
+		assert.deepEqual(await runtime.listSessions(), []);
+		assert.deepEqual(
+			(await runtime.listSessionsWithPresence([{ id: "ambiguous", path: join(sessionDir, "old.jsonl") }]))
+				.deletedSessionIds,
+			[],
+		);
+	});
+
+	it("one missing project directory does not block confirmations in another readable directory", async () => {
+		const agentDir = tempDir("pi-mgw-presence-mixed-");
+		const root = join(agentDir, "sessions");
+		const goneDir = join(root, "gone-project");
+		const keptDir = join(root, "kept-project");
+		mkdirSync(goneDir, { recursive: true });
+		mkdirSync(keptDir, { recursive: true });
+		const known = [
+			{ id: "a", path: join(goneDir, "a.jsonl") },
+			{ id: "b", path: join(keptDir, "b.jsonl") },
+		];
+		for (const item of known)
+			writeFileSync(
+				item.path,
+				`${JSON.stringify({ type: "session", version: 3, id: item.id, timestamp: "2026-10-01T00:00:00Z", cwd: agentDir })}\n`,
+			);
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		const runtime = new PiRuntime({
+			sessionFactory: async () => {
+				throw new Error("must not open handles");
+			},
+		});
+		try {
+			assert.equal((await runtime.listSessions()).length, 2);
+			rmSync(goneDir, { recursive: true });
+			rmSync(known[1].path);
+			assert.deepEqual((await runtime.listSessionsWithPresence(known)).deletedSessionIds, ["b"]);
+		} finally {
+			runtime.disposeAll();
+			if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previous;
+		}
+	});
+
+	it("confirms deleted idle files despite cached lists, but keeps moved files and live handles", async () => {
+		const sessionDir = tempDir("pi-mgw-presence-");
+		const path = join(sessionDir, "original.jsonl");
+		writeFileSync(
+			path,
+			`${JSON.stringify({ type: "session", version: 3, id: "deleted-id", timestamp: "2026-10-01T00:00:00Z", cwd: sessionDir })}\n`,
+		);
+		const { runtime } = fakeRuntime({ sessionDir });
+		await runtime.listSessions();
+		renameSync(path, join(sessionDir, "moved.jsonl"));
+		assert.deepEqual((await runtime.listSessionsWithPresence([{ id: "deleted-id", path }])).deletedSessionIds, []);
+		rmSync(join(sessionDir, "moved.jsonl"));
+		const result = await runtime.listSessionsWithPresence([{ id: "deleted-id", path }]);
+		assert.deepEqual(result.deletedSessionIds, ["deleted-id"]);
+		assert.deepEqual(result.items, []);
+		writeFileSync(
+			path,
+			`${JSON.stringify({ type: "session", version: 3, id: "live-id", timestamp: "2026-10-01T00:00:00Z", cwd: sessionDir })}\n`,
+		);
+		const { runtime: liveRuntime } = fakeRuntime({ sessionDir });
+		await liveRuntime.openSession("live-id");
+		rmSync(path);
+		assert.deepEqual((await liveRuntime.listSessionsWithPresence([{ id: "live-id", path }])).deletedSessionIds, []);
+	});
+
+	it("does not confirm unreadable/missing directories, corrupt scans or paths outside the session root", async () => {
+		const sessionDir = tempDir("pi-mgw-presence-errors-");
+		const path = join(sessionDir, "gone.jsonl");
+		const { runtime } = fakeRuntime({ sessionDir });
+		const known = [{ id: "gone", path }];
+		chmodSync(sessionDir, 0o000);
+		try {
+			assert.deepEqual((await runtime.listSessionsWithPresence(known)).deletedSessionIds, []);
+		} finally {
+			chmodSync(sessionDir, 0o700);
+		}
+		writeFileSync(join(sessionDir, "broken.jsonl"), "not a session\n");
+		assert.deepEqual((await runtime.listSessionsWithPresence(known)).deletedSessionIds, []);
+		rmSync(join(sessionDir, "broken.jsonl"));
+		assert.deepEqual(
+			(await runtime.listSessionsWithPresence([{ id: "outside", path: join(tempDir("pi-mgw-outside-"), "x.jsonl") }]))
+				.deletedSessionIds,
+			[],
+		);
+		rmSync(sessionDir, { recursive: true });
+		assert.deepEqual((await runtime.listSessionsWithPresence(known)).deletedSessionIds, []);
+	});
+
 	it("concurrent index readers share one scan", async (t) => {
 		let scans = 0;
 		let release!: () => void;

@@ -199,6 +199,7 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 						? [
 								"ping",
 								"sessions",
+								"session-presence-v1",
 								"subscribe",
 								"unsubscribe",
 								"message",
@@ -263,6 +264,7 @@ export function startDataPlane(options: DataPlaneOptions): Promise<DataPlane> {
 							]
 						: ["ping", "ping-id"]) satisfies (
 						| ClientFrameType
+						| "session-presence-v1"
 						| "tree-view-v1"
 						| "tree-actions-v1"
 						| "worktree-v1"

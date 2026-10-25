@@ -552,6 +552,7 @@ describe("hello capabilities advertisement", () => {
 			[...advertised].sort(),
 			[
 				...CLIENT_FRAME_TYPES,
+				"session-presence-v1",
 				"tree-view-v1",
 				"tree-actions-v1",
 				"worktree-v1",

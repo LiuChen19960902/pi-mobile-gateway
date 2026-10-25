@@ -1226,9 +1226,28 @@ export function connectClient(
 					return;
 				}
 				case "sessions": {
-					const items = await runtime.listSessions();
+					const known = Array.isArray(frame.knownSessions)
+						? frame.knownSessions.slice(0, 2048).flatMap((item) => {
+								if (!item || typeof item !== "object") return [];
+								const { id, path } = item as Record<string, unknown>;
+								return typeof id === "string" &&
+									id.length > 0 &&
+									id.length <= 256 &&
+									typeof path === "string" &&
+									path.length <= 4096
+									? [{ id, path }]
+									: [];
+							})
+						: [];
+					const presence = await runtime.listSessionsWithPresence(known);
+					// 无论当前模式是什么，都保护仍在线的原生实例；SDK 句柄由 runtime 自己保护。
+					const discovery = bridge?.discover();
+					const protectedIds = new Set(discovery?.descriptors.map((item) => item.sessionId));
+					const deletedSessionIds =
+						discovery?.complete === false ? [] : presence.deletedSessionIds.filter((id) => !protectedIds.has(id));
+					const items = presence.items;
 					if (!bridgeMode() || !bridge) {
-						send({ kind: "sessions", items });
+						send({ kind: "sessions", items, deletedSessionIds });
 						return;
 					}
 					// 磁盘历史与在线实例按真实 sessionId 合并成一个条目；在线实例的
@@ -1278,7 +1297,7 @@ export function connectClient(
 							runtime: runtimeRef,
 						});
 					}
-					send({ kind: "sessions", items: merged, mode: "bridge" });
+					send({ kind: "sessions", items: merged, mode: "bridge", deletedSessionIds });
 					return;
 				}
 
