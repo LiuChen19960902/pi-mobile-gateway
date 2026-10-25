@@ -255,11 +255,17 @@ export class BridgeHub {
 
 	/** 读取注册表，过滤 schema 不符、进程已退出与只读副本。 */
 	descriptors(): BridgeDescriptor[] {
+		return this.discover().descriptors;
+	}
+
+	/** 删除确认还需要知道注册表是否读全；未知实例不能冒充离线。 */
+	discover(): { descriptors: BridgeDescriptor[]; complete: boolean } {
+		let complete = true;
 		let names: string[];
 		try {
 			names = readdirSync(join(this.root, REGISTRY_DIR)).filter((name) => name.endsWith(".json"));
-		} catch {
-			return [];
+		} catch (error) {
+			return { descriptors: [], complete: (error as NodeJS.ErrnoException).code === "ENOENT" };
 		}
 		const bySession = new Map<string, BridgeDescriptor>();
 		for (const name of names) {
@@ -267,16 +273,20 @@ export class BridgeHub {
 			try {
 				value = JSON.parse(readFileSync(join(this.root, REGISTRY_DIR, name), "utf8")) as BridgeDescriptor;
 			} catch {
+				complete = false;
 				continue;
 			}
-			if (!value || value.schema !== BRIDGE_SCHEMA || typeof value.sessionId !== "string") continue;
+			if (!value || value.schema !== BRIDGE_SCHEMA || typeof value.sessionId !== "string") {
+				complete = false;
+				continue;
+			}
 			if (!isProcessAlive(value.pid)) continue;
 			const previous = bySession.get(value.sessionId);
 			if (!previous || (!previous.owner && value.owner) || previous.startedAt < value.startedAt) {
 				bySession.set(value.sessionId, value);
 			}
 		}
-		return [...bySession.values()];
+		return { descriptors: [...bySession.values()], complete };
 	}
 
 	descriptor(sessionId: string): BridgeDescriptor | undefined {

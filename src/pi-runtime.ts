@@ -41,8 +41,19 @@ import {
 //     prompt keeps running to completion even if the phone disconnects
 //     mid-run ("pi runs on the machine, the phone is just a remote").
 
-import { existsSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fstatSync,
+	lstatSync,
+	openSync,
+	readdirSync,
+	readSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
 	type AgentSessionEvent,
 	createAgentSession,
@@ -516,6 +527,92 @@ export class PiRuntime {
 	private isHandleRunning(sessionId: string): boolean {
 		const handle = this.handles.get(sessionId);
 		return handle !== undefined && (handle.session.isStreaming || this.isHandleCompacting(handle));
+	}
+
+	/** 列表缺项不证明删除：只确认客户端曾见路径的 ENOENT，扫描不完整时保守保留。 */
+	async listSessionsWithPresence(known: Array<{ id: string; path: string }>): Promise<{
+		items: WireSessionItem[];
+		deletedSessionIds: string[];
+	}> {
+		let items = await this.listSessions();
+		const result = { items, deletedSessionIds: [] as string[] };
+		const root = resolve(this.sessionDir ?? join(getAgentDir(), "sessions"));
+		const missing = (path: string): boolean => {
+			try {
+				lstatSync(path);
+				return false;
+			} catch (error) {
+				return (error as NodeJS.ErrnoException).code === "ENOENT";
+			}
+		};
+		const withinRoot = (path: string): boolean => {
+			const rel = relative(root, resolve(path));
+			return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel) && path.endsWith(".jsonl");
+		};
+		const candidates = known.filter((item) => withinRoot(item.path) && missing(item.path));
+		if (candidates.length === 0) return result;
+		const infos = await this.loadIndex(true);
+		items = await this.listSessions();
+		result.items = items;
+		try {
+			// SDK 会忽略普通 JSONL 日志，也会吞读取错误；前者不能阻断所有会话清理，
+			// 后者仍不能冒充删除证明。仅对已确认不是 Pi 会话的文件放行。
+			const directories = this.sessionDir
+				? [root]
+				: readdirSync(root, { withFileTypes: true })
+						.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+						.map((entry) => join(root, entry.name));
+			const files = directories.flatMap((dir) =>
+				readdirSync(dir)
+					.filter((name) => name.endsWith(".jsonl"))
+					.map((name) => resolve(dir, name)),
+			);
+			const indexed = new Set(infos.map((info) => resolve(info.path)));
+			const isNonSessionLog = (path: string): boolean => {
+				let fd: number | undefined;
+				try {
+					fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+					const stats = fstatSync(fd);
+					if (!stats.isFile()) return true;
+					// 只读有界首记录，不为判别日志加载整份历史或大工具输出。
+					const buffer = Buffer.alloc(64 * 1024);
+					const size = readSync(fd, buffer, 0, buffer.length, 0);
+					const lines = buffer.subarray(0, size).toString("utf8").split(/\r?\n/);
+					const first = lines.findIndex((item) => item.trim() !== "");
+					if (first < 0 || (first === lines.length - 1 && size < stats.size)) return false;
+					const entry: unknown = JSON.parse(lines[first]);
+					return isRecord(entry) && entry.type !== "session";
+				} catch {
+					return false;
+				} finally {
+					if (fd !== undefined) closeSync(fd);
+				}
+			};
+			if (files.some((path) => !indexed.has(path) && !isNonSessionLog(path))) return result;
+			const ids = new Set(infos.map((info) => info.id));
+			const realRoot = realpathSync(root);
+			result.deletedSessionIds = [
+				...new Set(
+					candidates
+						.filter(({ id, path }) => {
+							if (ids.has(id) || this.handles.has(id) || this.buildingLocks.has(id)) return false;
+							// 父目录必须仍存在且属于本会话根；父目录整体消失不能视为某个会话被删除。
+							if (!directories.includes(dirname(resolve(path)))) return false;
+							try {
+								const parent = realpathSync(dirname(path));
+								const rel = relative(realRoot, parent);
+								return !rel.startsWith("..") && !isAbsolute(rel) && missing(path);
+							} catch {
+								return false;
+							}
+						})
+						.map((item) => item.id),
+				),
+			];
+		} catch {
+			// ENOENT 只允许用于目标文件；目录不可读、损坏、移动等情况一律不确认。
+		}
+		return result;
 	}
 
 	private async resolveSessionPath(sessionId: string): Promise<string | null> {

@@ -224,6 +224,35 @@ describe("bridge hub", () => {
 });
 
 describe("router bridge frames", () => {
+	it("protects online native sessions even in SDK mode and declines deletion on corrupt discovery", async () => {
+		const fake = startFakeBridge("presence-native");
+		const sessionDir = tempDir("pi-mgw-presence-bridge-");
+		const runtime = emptyRuntime(sessionDir);
+		const frames: Array<Record<string, unknown>> = [];
+		const client = connectClient(runtime, (frame) => frames.push(frame), {
+			bridge: new BridgeHub({ root: fake.root }),
+		});
+		const knownSessions = [{ id: "presence-native", path: join(sessionDir, "gone.jsonl") }];
+		try {
+			await client.handleMessage({ type: "sessions", knownSessions });
+			assert.deepEqual(frames.at(-1)?.deletedSessionIds, []);
+			writeFileSync(join(fake.root, "registry", "broken.json"), "{");
+			await client.handleMessage({
+				type: "sessions",
+				knownSessions: [{ id: "another", path: join(sessionDir, "other.jsonl") }],
+			});
+			assert.deepEqual(frames.at(-1)?.deletedSessionIds, []);
+			rmSync(join(fake.root, "registry", "broken.json"));
+			await client.handleMessage({
+				type: "sessions",
+				knownSessions: [{ id: "another", path: join(sessionDir, "other.jsonl") }],
+			});
+			assert.deepEqual(frames.at(-1)?.deletedSessionIds, ["another"]);
+		} finally {
+			client.close();
+			runtime.disposeAll();
+		}
+	});
 	it("re-attaches a session after switching sdk -> bridge -> sdk", async () => {
 		const modeStore = new HostModeStore(join(tempDir("pi-mgw-bridge-mode-"), "host-mode.json"));
 		const bridge = new BridgeHub({ root: tempDir("pi-mgw-bridge-empty-") });

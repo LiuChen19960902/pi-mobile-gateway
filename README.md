@@ -2,7 +2,7 @@
 
 让手机通过**设备鉴权的 WebSocket** 连接并使用本机的 [pi](https://github.com/earendil-works/pi) coding agent：把 pi 的会话、实时回复和 Agent 执行轨迹带到移动端。
 
-配套 Android 客户端为 [pi-mobile-android](https://github.com/LiuChen19960902/pi-mobile-android)，版本 Android 1.2.0 ↔ gateway 0.5.0。网关使用锁定的 Pi SDK 1.3.0；终端 Pi 的安装与网关 npm 依赖独立，升级后需核对两者契约。
+配套 Android 客户端为 [pi-mobile-android](https://github.com/LiuChen19960902/pi-mobile-android)，版本 Android 1.2.2 ↔ gateway 0.5.1。网关使用锁定的 Pi SDK 1.3.0；终端 Pi 的安装与网关 npm 依赖独立，升级后需核对两者契约。
 
 ## 架构
 
