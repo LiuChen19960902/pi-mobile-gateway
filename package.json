@@ -18,19 +18,19 @@
 		"check": "npm run typecheck && npm run lint && npm test"
 	},
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "1.3.0",
-		"@earendil-works/pi-tui": "1.3.0",
+		"@earendil-works/pi-coding-agent": "1.4.0",
+		"@earendil-works/pi-tui": "1.4.0",
 		"qrcode-terminal": "0.12.0",
-		"ws": "8.21.3",
-		"@earendil-works/pi-ai": "1.3.0",
-		"undici": "8.12.2"
+		"ws": "8.22.0",
+		"@earendil-works/pi-ai": "1.4.0",
+		"undici": "8.12.3"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "2.5.7",
-		"@types/node": "24.13.3",
+		"@biomejs/biome": "2.6.3",
+		"@types/node": "26.6.5",
 		"@types/qrcode-terminal": "0.12.2",
-		"@types/ws": "8.18.1",
-		"typescript": "5.9.3"
+		"@types/ws": "8.18.2",
+		"typescript": "7.0.2"
 	},
 	"bin": {
 		"pi-mobile": "./bin/pi-mobile"
